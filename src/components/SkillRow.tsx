@@ -9,7 +9,7 @@ interface SkillRowProps {
 
 export default function SkillRow({ skill, index }: SkillRowProps) {
   return (
-    <Link href={`/skill/${skill.id}`}>
+    <Link href={`/skill/${skill.slug}`}>
       <div className="rule group py-5 cursor-pointer transition-colors duration-150 hover:bg-[oklch(0.96_0.005_80)]">
         <div className="container">
           <div className="grid grid-cols-12 gap-4 items-baseline">
@@ -35,16 +35,8 @@ export default function SkillRow({ skill, index }: SkillRowProps) {
                   className="text-[0.5625rem] tracking-[0.06em] uppercase text-muted-foreground border border-border px-1.5 py-0.5 shrink-0"
                   style={{ fontFamily: "var(--font-mono)" }}
                 >
-                  {artifactTypeLabels[skill.artifact_type]}
+                  {skill.artifact_type?.label || "Skill"}
                 </span>
-                {skill.verified && (
-                  <span
-                    className="text-[0.5625rem] tracking-[0.06em] uppercase text-muted-foreground shrink-0"
-                    style={{ fontFamily: "var(--font-mono)" }}
-                  >
-                    verified
-                  </span>
-                )}
               </div>
               <p className="text-[0.8125rem] text-muted-foreground leading-snug line-clamp-2">
                 {skill.description}
@@ -62,12 +54,14 @@ export default function SkillRow({ skill, index }: SkillRowProps) {
               ))}
             </div>
             <div className="col-span-6 lg:col-span-4 flex items-baseline justify-end gap-6">
-              <span
-                className="text-[0.6875rem] text-muted-foreground hidden sm:inline"
-                style={{ fontFamily: "var(--font-mono)" }}
-              >
-                {skill.compatible_platforms[0]}{skill.compatible_platforms.length > 1 ? ` +${skill.compatible_platforms.length - 1}` : ""}
-              </span>
+              {skill.artifact_platforms && skill.artifact_platforms.length > 0 && (
+                <span
+                  className="text-[0.6875rem] text-muted-foreground hidden sm:inline"
+                  style={{ fontFamily: "var(--font-mono)" }}
+                >
+                  {skill.artifact_platforms[0]?.platform?.label}{skill.artifact_platforms.length > 1 ? ` +${skill.artifact_platforms.length - 1}` : ""}
+                </span>
+              )}
               <span
                 className="text-[0.6875rem] text-muted-foreground"
                 style={{ fontFamily: "var(--font-mono)" }}
@@ -78,7 +72,7 @@ export default function SkillRow({ skill, index }: SkillRowProps) {
                 className="text-[0.6875rem] text-muted-foreground hidden sm:inline"
                 style={{ fontFamily: "var(--font-mono)" }}
               >
-                {getTimeAgo(skill.last_updated)}
+                {getTimeAgo(skill.github_updated_at)}
               </span>
             </div>
           </div>

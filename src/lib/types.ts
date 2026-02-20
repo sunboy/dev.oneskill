@@ -1,67 +1,123 @@
-export type ArtifactType = "skill" | "mcp_server" | "cursor_rule" | "n8n_node" | "workflow" | "langchain_tool" | "crewai_tool";
+// ─── Artifact type slugs (match artifact_types.slug in Supabase) ─────
+export type ArtifactTypeSlug =
+  | "skill"
+  | "mcp-server"
+  | "cursor-rules"
+  | "n8n-node"
+  | "workflow"
+  | "langchain-tool"
+  | "crewai-tool";
+
+// ─── DB row shapes ──────────────────────────────────────────────────
+
+export interface ArtifactType {
+  id: string;
+  slug: ArtifactTypeSlug;
+  label: string;
+  description: string;
+  is_active: boolean;
+  sort_order: number;
+}
+
+export interface Category {
+  id: string;
+  slug: string;
+  label: string;
+  is_active: boolean;
+  sort_order: number;
+}
+
+export interface Platform {
+  id: string;
+  slug: string;
+  label: string;
+  website_url?: string;
+  install_command_template?: string;
+  is_active: boolean;
+  sort_order: number;
+}
+
+export interface Contributor {
+  id: string;
+  github_username: string;
+  display_name: string;
+  avatar_url: string;
+  bio?: string;
+  location?: string;
+  website?: string;
+  github_url: string;
+  followers?: number;
+  public_repos?: number;
+}
+
+// ─── The main artifact, with joined relations ───────────────────────
 
 export interface Artifact {
   id: string;
+  slug: string;
   name: string;
   description: string;
   long_description: string;
-  author: string;
-  author_github: string;
+  artifact_type_id: string;
+  category_id: string;
+  contributor_id: string | null;
   github_url: string;
+  github_repo_full_name: string;
+  default_branch: string;
+  language: string | null;
+  license: string | null;
+  install_command: string;
+  npm_package_name: string | null;
   stars: number;
   forks: number;
-  last_updated: string;
-  category: string;
-  tags: string[];
-  artifact_type: ArtifactType;
-  compatible_platforms: string[];
-  language: string;
-  license: string;
-  version: string;
-  install_command: string;
-  npx_skills_command?: string;
+  open_issues: number;
   weekly_downloads: number;
-  verified: boolean;
-  is_featured: boolean;
   trending_score: number;
-  readme: string;
-  created_at?: string;
+  version: string | null;
+  readme_raw: string | null;
+  readme_excerpt: string | null;
+  tags: string[];
+  meta_title: string | null;
+  meta_description: string | null;
+  status: string;
+  source: string;
+  is_featured: boolean;
+  github_created_at: string;
+  github_updated_at: string;
+  last_pipeline_sync: string | null;
+  created_at: string;
+  updated_at: string;
+
+  // Joined relations (populated via Supabase select)
+  artifact_type?: ArtifactType;
+  category?: Category;
+  contributor?: Contributor;
+  artifact_platforms?: { platform: Platform }[];
 }
 
-export const artifactTypeLabels: Record<ArtifactType, string> = {
+// ─── UI constants ───────────────────────────────────────────────────
+
+export const artifactTypeLabels: Record<ArtifactTypeSlug, string> = {
   skill: "Skill",
-  mcp_server: "MCP Server",
-  cursor_rule: "Cursor Rule",
-  n8n_node: "n8n Node",
+  "mcp-server": "MCP Server",
+  "cursor-rules": "Cursor Rules",
+  "n8n-node": "n8n Node",
   workflow: "Workflow",
-  langchain_tool: "LangChain Tool",
-  crewai_tool: "CrewAI Tool",
+  "langchain-tool": "LangChain Tool",
+  "crewai-tool": "CrewAI Tool",
 };
 
-export const artifactTypes: ArtifactType[] = [
-  "skill", "mcp_server", "cursor_rule", "n8n_node", "workflow", "langchain_tool", "crewai_tool",
+export const artifactTypeSlugs: ArtifactTypeSlug[] = [
+  "skill",
+  "mcp-server",
+  "cursor-rules",
+  "n8n-node",
+  "workflow",
+  "langchain-tool",
+  "crewai-tool",
 ];
 
-export const categories = [
-  "All", "Automation", "Code Generation", "Data Analysis", "DevOps",
-  "Documentation", "Frontend", "Backend", "Research", "Security",
-  "Testing", "Web Scraping", "Workflow", "AI / ML",
-] as const;
-
-export const platforms = [
-  "All", "Claude Code", "Cursor", "Antigravity", "OpenClaw", "Codex",
-  "Windsurf", "GitHub Copilot", "Gemini CLI", "Cline", "Roo Code",
-  "Kiro CLI", "n8n", "LangChain", "CrewAI",
-] as const;
-
-export const allPlatforms = [
-  "Claude Code", "Cursor", "Antigravity", "OpenClaw", "Codex", "Windsurf",
-  "GitHub Copilot", "Gemini CLI", "Cline", "Roo Code", "Kiro CLI", "OpenCode",
-  "Goose", "Augment", "Trae", "Qwen Code", "Replit", "Amp", "Kimi Code CLI",
-  "CodeBuddy", "Command Code", "Continue", "Crush", "Droid", "iFlow CLI",
-  "Junie", "Kilo Code", "Kode", "MCPJam", "Mistral Vibe", "Mux", "OpenHands",
-  "Pi", "Qoder", "Trae CN", "Zencoder",
-];
+// ─── Utility functions ──────────────────────────────────────────────
 
 export function formatNumber(n: number): string {
   if (n >= 1000000) return (n / 1000000).toFixed(1).replace(/\.0$/, "") + "M";
@@ -72,7 +128,9 @@ export function formatNumber(n: number): string {
 export function getTimeAgo(dateStr: string): string {
   const date = new Date(dateStr);
   const now = new Date();
-  const diffDays = Math.floor((now.getTime() - date.getTime()) / (1000 * 60 * 60 * 24));
+  const diffDays = Math.floor(
+    (now.getTime() - date.getTime()) / (1000 * 60 * 60 * 24)
+  );
   if (diffDays === 0) return "today";
   if (diffDays === 1) return "yesterday";
   if (diffDays < 7) return `${diffDays}d ago`;

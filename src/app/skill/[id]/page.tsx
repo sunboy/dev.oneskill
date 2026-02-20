@@ -8,7 +8,13 @@ import CopyButton from "./CopyButton";
 
 export default async function SkillDetail({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const artifact = await getArtifactById(id);
+  // Support both slug and UUID lookups
+  let artifact = await getArtifactById(id);
+  if (!artifact) {
+    // Try as slug if not found as ID
+    const { getArtifactBySlug } = await import("@/lib/data");
+    artifact = await getArtifactBySlug(id);
+  }
   if (!artifact) notFound();
 
   return (
@@ -23,9 +29,9 @@ export default async function SkillDetail({ params }: { params: Promise<{ id: st
               <span className="text-[0.6875rem] text-muted-foreground editorial-link" style={{ fontFamily: "var(--font-mono)" }}>Explore</span>
             </Link>
             <span className="text-[0.6875rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>/</span>
-            <span className="text-[0.6875rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>{artifactTypeLabels[artifact.artifact_type]}</span>
+            <span className="text-[0.6875rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>{artifact.artifact_type?.label || "Skill"}</span>
             <span className="text-[0.6875rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>/</span>
-            <span className="text-[0.6875rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>{artifact.category}</span>
+            <span className="text-[0.6875rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>{artifact.category?.label || "Uncategorized"}</span>
             <span className="text-[0.6875rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>/</span>
             <span className="text-[0.6875rem] text-foreground" style={{ fontFamily: "var(--font-mono)" }}>{artifact.name}</span>
           </div>
@@ -41,13 +47,8 @@ export default async function SkillDetail({ params }: { params: Promise<{ id: st
                 {artifact.name}
               </h1>
               <span className="text-[0.625rem] tracking-[0.05em] uppercase text-muted-foreground border border-border px-1.5 py-0.5 shrink-0" style={{ fontFamily: "var(--font-mono)" }}>
-                {artifactTypeLabels[artifact.artifact_type]}
+                {artifact.artifact_type?.label || "Skill"}
               </span>
-              {artifact.verified && (
-                <span className="text-[0.625rem] tracking-[0.05em] uppercase text-muted-foreground border border-border px-1.5 py-0.5 shrink-0" style={{ fontFamily: "var(--font-mono)" }}>
-                  verified
-                </span>
-              )}
             </div>
 
             <p className="text-[1.0625rem] text-muted-foreground leading-relaxed max-w-[60ch] mb-8">
@@ -58,20 +59,17 @@ export default async function SkillDetail({ params }: { params: Promise<{ id: st
             <div className="mb-10">
               <span className="text-[0.625rem] tracking-[0.08em] uppercase text-muted-foreground block mb-2" style={{ fontFamily: "var(--font-mono)" }}>Install</span>
               <CopyButton text={artifact.install_command} label="click to copy" primary />
-              {artifact.npx_skills_command && artifact.npx_skills_command !== artifact.install_command && (
-                <CopyButton text={artifact.npx_skills_command} label="via npx skills" />
-              )}
             </div>
 
             {/* Compatible Platforms */}
             <div className="mb-10">
               <span className="text-[0.625rem] tracking-[0.08em] uppercase text-muted-foreground block mb-3" style={{ fontFamily: "var(--font-mono)" }}>
-                Compatible with {artifact.compatible_platforms.length} platforms
+                Compatible with {artifact.artifact_platforms?.length || 0} platforms
               </span>
               <div className="flex flex-wrap gap-2">
-                {artifact.compatible_platforms.map((platform: string) => (
-                  <span key={platform} className="text-[0.6875rem] tracking-[0.02em] text-muted-foreground px-2 py-1 border border-border" style={{ fontFamily: "var(--font-mono)" }}>
-                    {platform}
+                {artifact.artifact_platforms?.map(({ platform }) => (
+                  <span key={platform.id} className="text-[0.6875rem] tracking-[0.02em] text-muted-foreground px-2 py-1 border border-border" style={{ fontFamily: "var(--font-mono)" }}>
+                    {platform.label}
                   </span>
                 ))}
               </div>
@@ -90,12 +88,14 @@ export default async function SkillDetail({ params }: { params: Promise<{ id: st
             </div>
 
             {/* README */}
-            <div className="rule pt-8">
-              <span className="text-[0.625rem] tracking-[0.08em] uppercase text-muted-foreground block mb-4" style={{ fontFamily: "var(--font-mono)" }}>README.md</span>
-              <div className="prose prose-sm max-w-none">
-                <p className="text-[0.9375rem] leading-relaxed text-foreground whitespace-pre-line">{artifact.readme}</p>
+            {artifact.readme_raw && (
+              <div className="rule pt-8">
+                <span className="text-[0.625rem] tracking-[0.08em] uppercase text-muted-foreground block mb-4" style={{ fontFamily: "var(--font-mono)" }}>README.md</span>
+                <div className="prose prose-sm max-w-none">
+                  <p className="text-[0.9375rem] leading-relaxed text-foreground whitespace-pre-line">{artifact.readme_raw}</p>
+                </div>
               </div>
-            </div>
+            )}
           </div>
 
           {/* Sidebar */}
@@ -104,24 +104,26 @@ export default async function SkillDetail({ params }: { params: Promise<{ id: st
               <div className="mb-8">
                 <span className="text-[0.625rem] tracking-[0.08em] uppercase text-muted-foreground block mb-2" style={{ fontFamily: "var(--font-mono)" }}>Author</span>
                 <span className="text-[0.9375rem] font-semibold tracking-[-0.01em]" style={{ fontFamily: "var(--font-display)" }}>
-                  {artifact.author}
+                  {artifact.contributor?.display_name || artifact.contributor?.github_username || "Unknown"}
                 </span>
-                <span className="block text-[0.75rem] text-muted-foreground mt-0.5" style={{ fontFamily: "var(--font-mono)" }}>
-                  @{artifact.author_github}
-                </span>
+                {artifact.contributor?.github_username && (
+                  <span className="block text-[0.75rem] text-muted-foreground mt-0.5" style={{ fontFamily: "var(--font-mono)" }}>
+                    @{artifact.contributor.github_username}
+                  </span>
+                )}
               </div>
               <div className="rule" />
               <div className="py-6 grid grid-cols-2 gap-y-5 gap-x-4">
                 {[
-                  { label: "Type", value: artifactTypeLabels[artifact.artifact_type] },
+                  { label: "Type", value: artifact.artifact_type?.label || "Skill" },
                   { label: "Stars", value: formatNumber(artifact.stars) },
                   { label: "Forks", value: formatNumber(artifact.forks) },
                   { label: "Weekly DL", value: formatNumber(artifact.weekly_downloads) },
                   { label: "Version", value: artifact.version },
                   { label: "License", value: artifact.license },
-                  { label: "Updated", value: getTimeAgo(artifact.last_updated) },
+                  { label: "Updated", value: getTimeAgo(artifact.github_updated_at) },
                   { label: "Language", value: artifact.language },
-                  { label: "Platforms", value: String(artifact.compatible_platforms.length) },
+                  { label: "Platforms", value: String(artifact.artifact_platforms?.length || 0) },
                   { label: "Trending", value: String(artifact.trending_score) + "/100" },
                 ].map((item) => (
                   <div key={item.label}>

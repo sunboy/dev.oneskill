@@ -4,37 +4,59 @@ import { useState, useMemo, useRef, useEffect } from "react";
 import Navigation from "@/components/Navigation";
 import Footer from "@/components/Footer";
 import SkillRow from "@/components/SkillRow";
-import { mockArtifacts } from "@/lib/data";
-import { categories, platforms, artifactTypes, artifactTypeLabels, type ArtifactType } from "@/lib/types";
+import { getArtifacts } from "@/lib/data";
+import { artifactTypeSlugs, artifactTypeLabels, type ArtifactTypeSlug, type Category, type Platform } from "@/lib/types";
 import type { Artifact } from "@/lib/types";
 import { supabase } from "@/lib/supabase";
 
 type SortOption = "stars" | "updated" | "downloads" | "trending" | "name";
 
 export default function Explore() {
-  const [artifacts, setArtifacts] = useState<Artifact[]>(mockArtifacts);
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [platforms, setPlatforms] = useState<Platform[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [activeCategory, setActiveCategory] = useState("All");
   const [activePlatform, setActivePlatform] = useState("All");
-  const [activeType, setActiveType] = useState<ArtifactType | "all">("all");
+  const [activeType, setActiveType] = useState<ArtifactTypeSlug | "all">("all");
   const [sortBy, setSortBy] = useState<SortOption>("trending");
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    async function fetchArtifacts() {
+    async function fetchData() {
       try {
-        const { data, error } = await supabase
-          .from("artifacts")
-          .select("*")
-          .order("trending_score", { ascending: false });
-        if (!error && data && data.length > 0) {
-          setArtifacts(data as Artifact[]);
+        const [artifactsRes, categoriesRes, platformsRes] = await Promise.all([
+          supabase
+            .from("artifacts")
+            .select("*,artifact_type:artifact_types(*),category:categories(*),contributor:contributors(*),artifact_platforms(platform:platforms(*))")
+            .eq("status", "active")
+            .order("trending_score", { ascending: false }),
+          supabase
+            .from("categories")
+            .select("*")
+            .eq("is_active", true)
+            .order("sort_order"),
+          supabase
+            .from("platforms")
+            .select("*")
+            .eq("is_active", true)
+            .order("sort_order"),
+        ]);
+
+        if (!artifactsRes.error && artifactsRes.data && artifactsRes.data.length > 0) {
+          setArtifacts(artifactsRes.data as Artifact[]);
+        }
+        if (!categoriesRes.error && categoriesRes.data) {
+          setCategories(categoriesRes.data as Category[]);
+        }
+        if (!platformsRes.error && platformsRes.data) {
+          setPlatforms(platformsRes.data as Platform[]);
         }
       } catch {
         // Keep mock data
       }
     }
-    fetchArtifacts();
+    fetchData();
   }, []);
 
   useEffect(() => {
@@ -59,13 +81,13 @@ export default function Explore() {
           s.tags.some((t: string) => t.toLowerCase().includes(q))
       );
     }
-    if (activeCategory !== "All") result = result.filter((s) => s.category === activeCategory);
-    if (activePlatform !== "All") result = result.filter((s) => s.compatible_platforms.includes(activePlatform));
-    if (activeType !== "all") result = result.filter((s) => s.artifact_type === activeType);
+    if (activeCategory !== "All") result = result.filter((s) => s.category?.label === activeCategory);
+    if (activePlatform !== "All") result = result.filter((s) => s.artifact_platforms?.some(ap => ap.platform?.label === activePlatform));
+    if (activeType !== "all") result = result.filter((s) => s.artifact_type?.slug === activeType);
 
     switch (sortBy) {
       case "stars": result = [...result].sort((a, b) => b.stars - a.stars); break;
-      case "updated": result = [...result].sort((a, b) => new Date(b.last_updated).getTime() - new Date(a.last_updated).getTime()); break;
+      case "updated": result = [...result].sort((a, b) => new Date(b.github_updated_at).getTime() - new Date(a.github_updated_at).getTime()); break;
       case "downloads": result = [...result].sort((a, b) => b.weekly_downloads - a.weekly_downloads); break;
       case "trending": result = [...result].sort((a, b) => b.trending_score - a.trending_score); break;
       case "name": result = [...result].sort((a, b) => a.name.localeCompare(b.name)); break;
@@ -120,7 +142,7 @@ export default function Explore() {
               >
                 All
               </button>
-              {artifactTypes.map((type) => (
+              {artifactTypeSlugs.map((type) => (
                 <button
                   key={type}
                   onClick={() => setActiveType(type)}
@@ -141,14 +163,21 @@ export default function Explore() {
           <div className="flex items-baseline gap-6">
             <span className="text-[0.5625rem] tracking-[0.1em] uppercase text-muted-foreground shrink-0" style={{ fontFamily: "var(--font-mono)" }}>Category</span>
             <div className="flex items-baseline gap-1 flex-wrap">
+              <button
+                onClick={() => setActiveCategory("All")}
+                className={`text-[0.75rem] px-2.5 py-1 border transition-all duration-150 ${activeCategory === "All" ? "border-foreground text-foreground bg-foreground/[0.04]" : "border-transparent text-muted-foreground hover:text-foreground hover:border-border"}`}
+                style={{ fontFamily: "var(--font-display)" }}
+              >
+                All
+              </button>
               {categories.map((cat) => (
                 <button
-                  key={cat}
-                  onClick={() => setActiveCategory(cat)}
-                  className={`text-[0.75rem] px-2.5 py-1 border transition-all duration-150 ${activeCategory === cat ? "border-foreground text-foreground bg-foreground/[0.04]" : "border-transparent text-muted-foreground hover:text-foreground hover:border-border"}`}
+                  key={cat.id}
+                  onClick={() => setActiveCategory(cat.label)}
+                  className={`text-[0.75rem] px-2.5 py-1 border transition-all duration-150 ${activeCategory === cat.label ? "border-foreground text-foreground bg-foreground/[0.04]" : "border-transparent text-muted-foreground hover:text-foreground hover:border-border"}`}
                   style={{ fontFamily: "var(--font-display)" }}
                 >
-                  {cat}
+                  {cat.label}
                 </button>
               ))}
             </div>
@@ -162,14 +191,21 @@ export default function Explore() {
           <div className="flex items-baseline gap-6">
             <span className="text-[0.5625rem] tracking-[0.1em] uppercase text-muted-foreground shrink-0" style={{ fontFamily: "var(--font-mono)" }}>Platform</span>
             <div className="flex items-baseline gap-1 flex-wrap">
+              <button
+                onClick={() => setActivePlatform("All")}
+                className={`text-[0.75rem] px-2.5 py-1 border transition-all duration-150 ${activePlatform === "All" ? "border-foreground text-foreground bg-foreground/[0.04]" : "border-transparent text-muted-foreground hover:text-foreground hover:border-border"}`}
+                style={{ fontFamily: "var(--font-display)" }}
+              >
+                All
+              </button>
               {platforms.map((plat) => (
                 <button
-                  key={plat}
-                  onClick={() => setActivePlatform(plat)}
-                  className={`text-[0.75rem] px-2.5 py-1 border transition-all duration-150 ${activePlatform === plat ? "border-foreground text-foreground bg-foreground/[0.04]" : "border-transparent text-muted-foreground hover:text-foreground hover:border-border"}`}
+                  key={plat.id}
+                  onClick={() => setActivePlatform(plat.label)}
+                  className={`text-[0.75rem] px-2.5 py-1 border transition-all duration-150 ${activePlatform === plat.label ? "border-foreground text-foreground bg-foreground/[0.04]" : "border-transparent text-muted-foreground hover:text-foreground hover:border-border"}`}
                   style={{ fontFamily: "var(--font-display)" }}
                 >
-                  {plat}
+                  {plat.label}
                 </button>
               ))}
             </div>

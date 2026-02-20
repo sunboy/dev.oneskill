@@ -8,7 +8,7 @@ import type { Artifact } from "@/lib/types";
 export default async function ContributorProfile({ params }: { params: Promise<{ username: string }> }) {
   const { username } = await params;
   const allArtifacts = await getArtifacts();
-  const artifacts = allArtifacts.filter(a => a.author_github === username);
+  const artifacts = allArtifacts.filter(a => a.contributor?.github_username === username);
 
   return (
     <div className="min-h-screen flex flex-col">

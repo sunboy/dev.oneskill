@@ -144,7 +144,7 @@ export default async function Home() {
 
         <div className="grid grid-cols-1 md:grid-cols-2">
           {featured.map((artifact: Artifact, i: number) => (
-            <Link key={artifact.id} href={`/skill/${artifact.id}`}>
+            <Link key={artifact.id} href={`/skill/${artifact.slug}`}>
               <div
                 className={`group py-8 px-6 transition-colors duration-150 hover:bg-[oklch(0.96_0.005_80)] cursor-pointer border-border ${
                   i % 2 !== 0 ? "md:border-l" : ""
@@ -155,7 +155,7 @@ export default async function Home() {
                     className="text-[0.625rem] tracking-[0.06em] uppercase text-muted-foreground border border-border px-1.5 py-0.5"
                     style={{ fontFamily: "var(--font-mono)" }}
                   >
-                    {artifactTypeLabels[artifact.artifact_type]}
+                    {artifact.artifact_type?.label || "Skill"}
                   </span>
                   <span className="text-[0.625rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>
                     {formatNumber(artifact.stars)} stars
@@ -175,11 +175,11 @@ export default async function Home() {
                 </p>
                 <div className="flex items-baseline gap-2">
                   <span className="text-[0.625rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>
-                    @{artifact.author_github}
+                    @{artifact.contributor?.github_username || "Unknown"}
                   </span>
                   <span className="text-[0.625rem] text-muted-foreground">·</span>
                   <span className="text-[0.625rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>
-                    {artifact.compatible_platforms.length} platforms
+                    {artifact.artifact_platforms?.length || 0} platforms
                   </span>
                 </div>
               </div>
