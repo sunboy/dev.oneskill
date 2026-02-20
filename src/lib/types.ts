@@ -88,6 +88,15 @@ export interface Artifact {
   created_at: string;
   updated_at: string;
 
+  // Vibe score fields
+  vibe_score: number;
+  npm_downloads_weekly: number;
+  pypi_downloads_weekly: number;
+  mention_count_7d: number;
+  mention_count_30d: number;
+  sentiment_avg: number;
+  vibe_updated_at: string | null;
+
   // Joined relations (populated via Supabase select)
   artifact_type?: ArtifactType;
   category?: Category;
