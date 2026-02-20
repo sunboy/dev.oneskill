@@ -2,14 +2,23 @@ name: Scrape GitHub for Agent Artifacts
 
 on:
   schedule:
-    # Every 6 hours (0:00, 6:00, 12:00, 18:00 UTC)
-    - cron: '0 0,6,12,18 * * *'
+    # Incremental every 4 hours (0:00, 4:00, 8:00, 12:00, 16:00, 20:00 UTC)
+    - cron: '0 0,4,8,12,16,20 * * *'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Scraper mode'
+        required: true
+        default: 'incremental'
+        type: choice
+        options:
+          - incremental
+          - bulk
 
 jobs:
   scrape-artifacts:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
 
     permissions:
       contents: read
@@ -23,8 +32,20 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Run artifact scraper
+      - name: Run artifact scraper (incremental)
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'incremental')
         run: node scripts/scrape-github.mjs
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run artifact scraper (bulk)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'bulk'
+        run: node scripts/scrape-github.mjs --bulk
+        timeout-minutes: 110
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}

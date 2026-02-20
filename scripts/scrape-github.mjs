@@ -1,77 +1,120 @@
 #!/usr/bin/env node
 
 /**
- * OneSkill GitHub Artifact Scraper  v2
+ * OneSkill GitHub Artifact Scraper  v3
  *
- * Discovers agent artifacts on GitHub (skills, MCP servers, Cursor rules,
- * n8n nodes, workflows, LangChain tools, CrewAI tools), enriches metadata
- * via Gemini Flash, and upserts into Supabase's normalized schema.
+ * Two modes:
+ *   BULK  (--bulk)  : First-time full index. No repo cap, pages through
+ *                     everything, stores cursor in Supabase for resume.
+ *   INCREMENTAL     : Default. Picks up new/updated repos since last run.
+ *                     Runs every 4h via GitHub Actions.
  *
- * Supabase tables used:
- *   artifact_types   – lookup (slug → uuid)
- *   categories       – lookup (slug → uuid)
- *   platforms        – lookup (slug → uuid)
- *   contributors     – upsert by github_username
- *   artifacts        – main table (uuid PK, FK refs)
- *   artifact_platforms – junction table (artifact_id, platform_id)
+ * Pipeline:  GitHub Search → README fetch → Gemini enrichment → Supabase upsert
  *
- * Runs every 6 h via GitHub Actions.  Max ~150 repos per run.
+ * Supabase tables:
+ *   artifact_types, categories, platforms        – lookups
+ *   contributors                                 – upsert by github_username
+ *   artifacts                                    – main table (upsert on github_repo_full_name)
+ *   artifact_platforms                           – junction table
+ *   scraper_state                                – cursor/offset tracking per query
  */
 
 // ─────────────────────────── Configuration ───────────────────────────
 
-const MAX_REPOS        = 150;
-const BATCH_SIZE       = 20;
-const GEMINI_BATCH     = 10;   // repos per Gemini call (~10x fewer API calls)
-const GEMINI_MODEL     = 'gemini-2.5-flash';
-const GEMINI_URL       = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+const MODE           = process.argv.includes('--bulk') ? 'bulk' : 'incremental';
+const BATCH_SIZE     = 20;    // Supabase upsert batch
+const GEMINI_BATCH   = 10;    // repos per Gemini call
+const GEMINI_MODEL   = 'gemini-2.5-flash';
+const GEMINI_URL     = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+
+// Incremental: cap per run to stay within GitHub Actions timeout
+const INCREMENTAL_CAP = 300;
+// Bulk: process this many per query before moving to next (avoid starving other types)
+const BULK_PER_QUERY  = 500;
+
+// GitHub Search API returns max 1000 results per query.
+// We use star-range buckets to get past this limit.
+const STAR_BUCKETS = [
+  'stars:>1000', 'stars:501..1000', 'stars:201..500', 'stars:101..200',
+  'stars:51..100', 'stars:21..50', 'stars:11..20', 'stars:6..10',
+  'stars:3..5', 'stars:1..2', 'stars:0',
+];
 
 // ─────────────────────────── Search Queries ──────────────────────────
-// hint = slug that maps to artifact_types.slug
+// Each query can be "bucketed" by stars to get past the 1000-result GitHub limit.
+// pages: max pages to fetch per bucket (30 results/page, max ~33 pages = 1000)
+// bucketed: if true, we append each STAR_BUCKET to get full coverage
 
 const SEARCH_QUERIES = [
-  // ── MCP Servers ─────────────────────────────────────────────────────
-  { hint: 'mcp-server', q: '"mcp-server" in:name language:TypeScript', sort: 'stars', pages: 3 },
-  { hint: 'mcp-server', q: '"mcp-server" in:name language:Python', sort: 'stars', pages: 3 },
-  { hint: 'mcp-server', q: 'topic:mcp-server stars:>50', sort: 'stars', pages: 2 },
-  { hint: 'mcp-server', q: 'topic:model-context-protocol', sort: 'stars', pages: 2 },
-  { hint: 'mcp-server', q: '"@modelcontextprotocol" in:name,description', sort: 'stars', pages: 1 },
+  // ── MCP Servers (~8,600+) ─────────────────────────────────────────
+  { hint: 'mcp-server', q: '"mcp-server" in:name language:TypeScript', sort: 'stars', pages: 34, bucketed: true },
+  { hint: 'mcp-server', q: '"mcp-server" in:name language:Python',     sort: 'stars', pages: 34, bucketed: true },
+  { hint: 'mcp-server', q: '"mcp-server" in:name language:Go',         sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'mcp-server', q: '"mcp-server" in:name language:Rust',       sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'mcp-server', q: '"mcp-server" in:name language:Java',       sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'mcp-server', q: '"mcp-server" in:name language:C#',         sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'mcp-server', q: 'topic:mcp-server',                         sort: 'stars', pages: 34, bucketed: true },
+  { hint: 'mcp-server', q: 'topic:model-context-protocol',             sort: 'stars', pages: 20, bucketed: false },
+  { hint: 'mcp-server', q: '"mcp" "server" in:name,description filename:mcp.json', sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'mcp-server', q: '"@modelcontextprotocol/sdk" in:readme',    sort: 'stars', pages: 10, bucketed: false },
 
-  // ── Cursor Rules ────────────────────────────────────────────────────
-  { hint: 'cursor-rules', q: 'topic:cursor-rules', sort: 'stars', pages: 2 },
-  { hint: 'cursor-rules', q: 'topic:cursorrules', sort: 'stars', pages: 1 },
-  { hint: 'cursor-rules', q: '"cursorrules" in:name,description', sort: 'stars', pages: 2 },
-  { hint: 'cursor-rules', q: '"cursor rules" in:name,description', sort: 'stars', pages: 1 },
+  // ── Cursor Rules (~800+) ──────────────────────────────────────────
+  { hint: 'cursor-rules', q: 'topic:cursor-rules',                            sort: 'stars', pages: 34, bucketed: false },
+  { hint: 'cursor-rules', q: 'topic:cursorrules',                             sort: 'stars', pages: 34, bucketed: false },
+  { hint: 'cursor-rules', q: '"cursorrules" in:name,description',             sort: 'stars', pages: 20, bucketed: false },
+  { hint: 'cursor-rules', q: '"cursor rules" in:name,description',            sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'cursor-rules', q: '"cursor-rules" in:name',                        sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'cursor-rules', q: 'topic:cursor-skills',                           sort: 'stars', pages: 5,  bucketed: false },
+  { hint: 'cursor-rules', q: 'filename:.cursorrules path:/',                  sort: 'stars', pages: 20, bucketed: false },
 
-  // ── Skills ──────────────────────────────────────────────────────────
-  { hint: 'skill', q: '"agent-skills" in:name', sort: 'stars', pages: 2 },
-  { hint: 'skill', q: 'topic:claude-code stars:>100', sort: 'stars', pages: 2 },
-  { hint: 'skill', q: 'topic:oneskill', sort: 'stars', pages: 2 },
-  { hint: 'skill', q: 'topic:agent-skill', sort: 'stars', pages: 1 },
-  { hint: 'skill', q: 'filename:SKILL.md', sort: 'stars', pages: 2 },
-  { hint: 'skill', q: '"npx skills add" in:readme', sort: 'stars', pages: 1 },
-  { hint: 'skill', q: '"claude-code-skill" in:name,description,topics', sort: 'stars', pages: 1 },
+  // ── Skills / Claude Code (~15,000+) ───────────────────────────────
+  { hint: 'skill', q: 'topic:agent-skills',                                   sort: 'stars', pages: 34, bucketed: true },
+  { hint: 'skill', q: 'topic:agent-skill',                                    sort: 'stars', pages: 20, bucketed: false },
+  { hint: 'skill', q: 'topic:claude-skills',                                  sort: 'stars', pages: 20, bucketed: false },
+  { hint: 'skill', q: 'topic:claude-code',                                    sort: 'stars', pages: 34, bucketed: true },
+  { hint: 'skill', q: '"agent-skills" in:name',                               sort: 'stars', pages: 34, bucketed: true },
+  { hint: 'skill', q: 'filename:SKILL.md',                                    sort: 'stars', pages: 34, bucketed: true },
+  { hint: 'skill', q: '"npx skills add" in:readme',                           sort: 'stars', pages: 20, bucketed: false },
+  { hint: 'skill', q: '"claude-code-skill" in:name,description,topics',       sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'skill', q: 'topic:oneskill',                                       sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'skill', q: '"skillkit" in:name,description',                       sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'skill', q: '"claude-code" "plugin" in:name,description',           sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'skill', q: '"agent-skills-cli" OR "openskills" in:readme',         sort: 'stars', pages: 5,  bucketed: false },
 
-  // ── n8n Nodes ───────────────────────────────────────────────────────
-  { hint: 'n8n-node', q: 'topic:n8n-community-node', sort: 'stars', pages: 2 },
-  { hint: 'n8n-node', q: 'topic:n8n-node', sort: 'stars', pages: 1 },
-  { hint: 'n8n-node', q: '"n8n-nodes-" in:name', sort: 'stars', pages: 1 },
-  { hint: 'n8n-node', q: '"n8n community node" in:description', sort: 'stars', pages: 1 },
+  // ── n8n Nodes (~5,800+) ───────────────────────────────────────────
+  { hint: 'n8n-node', q: '"n8n-nodes-" in:name',                              sort: 'stars', pages: 34, bucketed: true },
+  { hint: 'n8n-node', q: 'topic:n8n-community-node-package',                  sort: 'stars', pages: 34, bucketed: true },
+  { hint: 'n8n-node', q: 'topic:n8n-community-node',                          sort: 'stars', pages: 34, bucketed: false },
+  { hint: 'n8n-node', q: 'topic:n8n-community-nodes',                         sort: 'stars', pages: 34, bucketed: false },
+  { hint: 'n8n-node', q: 'topic:n8n-node',                                    sort: 'stars', pages: 20, bucketed: false },
+  { hint: 'n8n-node', q: '"n8n community node" in:description',               sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'n8n-node', q: '"n8n-community-node-package" in:readme',            sort: 'stars', pages: 20, bucketed: false },
+  { hint: 'n8n-node', q: '"n8n-nodes" in:name language:TypeScript',           sort: 'stars', pages: 20, bucketed: false },
 
-  // ── Workflows ───────────────────────────────────────────────────────
-  { hint: 'workflow', q: 'topic:ai-workflow', sort: 'stars', pages: 1 },
-  { hint: 'workflow', q: 'topic:agent-workflow', sort: 'stars', pages: 1 },
-  { hint: 'workflow', q: '"ai workflow" in:name,description topic:automation', sort: 'stars', pages: 1 },
+  // ── Workflows (~thousands) ────────────────────────────────────────
+  { hint: 'workflow', q: 'topic:ai-workflow',                                  sort: 'stars', pages: 20, bucketed: false },
+  { hint: 'workflow', q: 'topic:agent-workflow',                               sort: 'stars', pages: 20, bucketed: false },
+  { hint: 'workflow', q: 'topic:agentic-workflow',                             sort: 'stars', pages: 20, bucketed: false },
+  { hint: 'workflow', q: 'topic:langgraph',                                    sort: 'stars', pages: 34, bucketed: false },
+  { hint: 'workflow', q: 'topic:agent-orchestration',                          sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'workflow', q: '"agent workflow" in:name,description',               sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'workflow', q: '"ai workflow" in:name,description',                  sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'workflow', q: 'topic:autogen',                                      sort: 'stars', pages: 10, bucketed: false },
 
-  // ── LangChain Tools ─────────────────────────────────────────────────
-  { hint: 'langchain-tool', q: 'topic:langchain-tool', sort: 'stars', pages: 2 },
-  { hint: 'langchain-tool', q: 'topic:langchain-tools', sort: 'stars', pages: 1 },
-  { hint: 'langchain-tool', q: '"langchain tool" in:name,description', sort: 'stars', pages: 1 },
+  // ── LangChain Tools (~1,000+) ─────────────────────────────────────
+  { hint: 'langchain-tool', q: 'topic:langchain-tool',                        sort: 'stars', pages: 20, bucketed: false },
+  { hint: 'langchain-tool', q: 'topic:langchain-tools',                       sort: 'stars', pages: 20, bucketed: false },
+  { hint: 'langchain-tool', q: '"langchain" "tool" in:name,description',      sort: 'stars', pages: 34, bucketed: true },
+  { hint: 'langchain-tool', q: '"langchain-community" in:name',               sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'langchain-tool', q: 'topic:langchain language:python',             sort: 'stars', pages: 20, bucketed: false },
+  { hint: 'langchain-tool', q: '"langchain" "integration" in:name,description', sort: 'stars', pages: 10, bucketed: false },
 
-  // ── CrewAI Tools ────────────────────────────────────────────────────
-  { hint: 'crewai-tool', q: 'topic:crewai', sort: 'stars', pages: 2 },
-  { hint: 'crewai-tool', q: '"crewai" "tool" in:name,description', sort: 'stars', pages: 1 },
-  { hint: 'crewai-tool', q: '"crewai_tools" in:readme', sort: 'stars', pages: 1 },
+  // ── CrewAI Tools (~500+) ──────────────────────────────────────────
+  { hint: 'crewai-tool', q: 'topic:crewai',                                   sort: 'stars', pages: 34, bucketed: true },
+  { hint: 'crewai-tool', q: 'topic:crewai-tools',                             sort: 'stars', pages: 20, bucketed: false },
+  { hint: 'crewai-tool', q: '"crewai" "tool" in:name,description',            sort: 'stars', pages: 20, bucketed: false },
+  { hint: 'crewai-tool', q: '"crewai_tools" in:readme',                       sort: 'stars', pages: 10, bucketed: false },
+  { hint: 'crewai-tool', q: '"crewai" in:name language:python',               sort: 'stars', pages: 20, bucketed: false },
 ];
 
 // ─────────────────────────── Helpers ─────────────────────────────────
@@ -93,7 +136,7 @@ function validateEnv() {
   const missing  = required.filter((k) => !ENV[k]);
   if (missing.length) { console.error(`Missing env vars: ${missing.join(', ')}`); process.exit(1); }
   if (!ENV.GITHUB_PAT) log('⚠️', 'No GITHUB_PAT — search rate limit will be 10 req/min');
-  log('✅', 'Environment OK');
+  log('✅', `Environment OK — mode: ${MODE}`);
 }
 
 // ─────────────────────────── Supabase helpers ────────────────────────
@@ -112,7 +155,6 @@ async function sbGet(table, query = '') {
 
 async function sbUpsert(table, rows, onConflict) {
   const headers = { ...sbHeaders(), Prefer: 'resolution=merge-duplicates,return=representation' };
-  if (onConflict) headers['Prefer'] = `resolution=merge-duplicates,return=representation`;
   const res = await fetch(
     `${ENV.SUPABASE_URL}/rest/v1/${table}${onConflict ? `?on_conflict=${onConflict}` : ''}`,
     { method: 'POST', headers, body: JSON.stringify(rows) },
@@ -122,6 +164,34 @@ async function sbUpsert(table, rows, onConflict) {
     throw new Error(`Supabase UPSERT ${table}: ${res.status} ${text.substring(0, 300)}`);
   }
   return res.json();
+}
+
+// ─────────────────────────── Scraper state (cursor tracking) ────────
+// Stores per-query offset so bulk runs can resume across invocations.
+
+async function loadScraperState() {
+  try {
+    const rows = await sbGet('scraper_state', 'select=query_key,last_page,last_bucket_idx,updated_at');
+    const state = {};
+    for (const r of rows) state[r.query_key] = r;
+    return state;
+  } catch {
+    // Table might not exist yet — that's OK for first run
+    return {};
+  }
+}
+
+async function saveScraperState(queryKey, lastPage, lastBucketIdx) {
+  try {
+    await sbUpsert('scraper_state', [{
+      query_key: queryKey,
+      last_page: lastPage,
+      last_bucket_idx: lastBucketIdx,
+      updated_at: new Date().toISOString(),
+    }], 'query_key');
+  } catch (err) {
+    log('  ', `State save failed for ${queryKey}: ${err.message.substring(0, 80)}`);
+  }
 }
 
 // ─────────────────────────── Lookup maps ─────────────────────────────
@@ -146,32 +216,23 @@ async function loadLookups() {
 
 // Map Gemini's category labels to DB slugs
 const CATEGORY_LABEL_TO_SLUG = {
-  'Frontend': 'frontend',
-  'Backend': 'backend',
-  'DevOps': 'devops',
-  'AI / ML': 'ai-ml',
-  'Database': 'database',
-  'Security': 'security',
-  'Automation': 'automation',
-  'Web Scraping': 'web-scraping',
-  'Research': 'research',
-  'Design': 'design',
-  'Mobile': 'mobile',
-  'Testing': 'testing',
-  'Data Engineering': 'data-engineering',
-  'Documentation': 'documentation',
+  'Frontend': 'frontend', 'Backend': 'backend', 'DevOps': 'devops',
+  'AI / ML': 'ai-ml', 'Database': 'database', 'Security': 'security',
+  'Automation': 'automation', 'Web Scraping': 'web-scraping', 'Research': 'research',
+  'Design': 'design', 'Mobile': 'mobile', 'Testing': 'testing',
+  'Data Engineering': 'data-engineering', 'Documentation': 'documentation',
   'Productivity': 'productivity',
 };
 
 // Default platform labels per artifact type slug
 const PLATFORM_DEFAULTS = {
-  'skill': ['Claude Code', 'Cursor', 'Windsurf', 'Cline', 'Roo Code', 'OpenCode', 'Kiro CLI', 'GitHub Copilot'],
-  'mcp-server': ['Claude Code', 'Cursor', 'Cline', 'Windsurf', 'Roo Code', 'OpenCode', 'Kiro CLI', 'Continue'],
-  'cursor-rules': ['Cursor'],
-  'n8n-node': ['n8n'],
-  'workflow': ['n8n', 'LangChain', 'CrewAI'],
+  'skill':          ['Claude Code', 'Cursor', 'Windsurf', 'Cline', 'Roo Code', 'OpenCode', 'Kiro CLI', 'GitHub Copilot'],
+  'mcp-server':     ['Claude Code', 'Cursor', 'Cline', 'Windsurf', 'Roo Code', 'OpenCode', 'Kiro CLI', 'Continue'],
+  'cursor-rules':   ['Cursor'],
+  'n8n-node':       ['n8n'],
+  'workflow':       ['n8n', 'LangChain', 'CrewAI'],
   'langchain-tool': ['LangChain'],
-  'crewai-tool': ['CrewAI'],
+  'crewai-tool':    ['CrewAI'],
 };
 
 // ─────────────────────────── GitHub API ──────────────────────────────
@@ -179,7 +240,7 @@ const PLATFORM_DEFAULTS = {
 async function githubFetch(url, raw = false) {
   const headers = {
     Accept: raw ? 'application/vnd.github.v3.raw' : 'application/vnd.github.v3+json',
-    'User-Agent': 'OneSkill-Scraper/2.0',
+    'User-Agent': 'OneSkill-Scraper/3.0',
   };
   if (ENV.GITHUB_PAT) headers.Authorization = `token ${ENV.GITHUB_PAT}`;
 
@@ -194,9 +255,13 @@ async function githubFetch(url, raw = false) {
   }
 
   if (res.status === 403 || res.status === 429) {
-    log('🛑', `Rate limited (${res.status}) — skipping`);
+    log('🛑', `Rate limited (${res.status}) — waiting for reset`);
+    const reset = parseInt(res.headers.get('x-ratelimit-reset') || '0', 10) * 1000;
+    const wait  = Math.max(5000, reset - Date.now()) + 1500;
+    await sleep(Math.min(wait, 65000));
     return null;
   }
+  if (res.status === 422) return null;  // unprocessable query
   if (!res.ok) return null;
   return raw ? res.text() : res.json();
 }
@@ -211,8 +276,9 @@ async function searchRepos(query, sort = 'stars', pages = 1) {
     const data = await githubFetch(url);
     if (!data || !data.items) break;
     repos.push(...data.items);
-    if (data.items.length < 30) break;
-    await sleep(2200);
+    if (data.items.length < 30) break;   // last page
+    if (page >= 34) break;               // GitHub hard limit: 1000 results (34*30)
+    await sleep(2200);                    // Search API: 30 req/min
   }
   return repos;
 }
@@ -236,20 +302,13 @@ const GEMINI_PLATFORMS  = [
 ];
 
 // ─── JSON repair helper ─────────────────────────────────────────────
-// Gemini sometimes outputs malformed JSON (unescaped quotes in strings,
-// trailing commas, etc.).  This attempts lightweight fixes before giving up.
 function repairJSON(raw) {
   let s = raw;
-  // Strip markdown fences
   s = s.replace(/^```(?:json)?\s*/gm, '').replace(/```\s*$/gm, '');
-  // Remove trailing commas before ] or }
   s = s.replace(/,\s*([\]}])/g, '$1');
-  // Try parsing as-is first
   try { return JSON.parse(s); } catch (_) { /* continue */ }
-  // Try extracting just the array
   const m = s.match(/\[[\s\S]*\]/);
   if (m) { try { return JSON.parse(m[0]); } catch (_) { /* continue */ } }
-  // Last resort: aggressive newline / control char cleanup inside strings
   s = s.replace(/[\x00-\x1f]/g, (ch) => ch === '\n' ? '\\n' : ch === '\t' ? '\\t' : '');
   const m2 = s.match(/\[[\s\S]*\]/);
   if (m2) { return JSON.parse(m2[0]); }
@@ -315,11 +374,7 @@ async function enrichOneWithGemini(item, retries = 1) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: buildGeminiPrompt([item]) }] }],
-          generationConfig: {
-            temperature: 0.15,
-            maxOutputTokens: 600,
-            responseMimeType: 'application/json',
-          },
+          generationConfig: { temperature: 0.15, maxOutputTokens: 600, responseMimeType: 'application/json' },
         }),
       });
       if (res.status === 429) { await sleep(Math.pow(2, attempt + 1) * 5000); continue; }
@@ -339,9 +394,7 @@ async function enrichOneWithGemini(item, retries = 1) {
 
 /**
  * Enrich a batch of repos in a SINGLE Gemini call.
- * Falls back to individual calls if batch JSON parsing fails.
- * @param {Array<{ repo: object, readme: string|null, hint: string }>} items
- * @returns {Promise<Array<object|null>>}  enrichment per item (same order)
+ * Falls back to individual calls if batch parsing fails.
  */
 async function enrichBatchWithGemini(items, retries = 2) {
   const prompt = buildGeminiPrompt(items);
@@ -353,49 +406,33 @@ async function enrichBatchWithGemini(items, retries = 2) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.15,
-            maxOutputTokens: items.length * 400,
-            responseMimeType: 'application/json',
-          },
+          generationConfig: { temperature: 0.15, maxOutputTokens: items.length * 400, responseMimeType: 'application/json' },
         }),
       });
 
       if (res.status === 429) {
         const wait = Math.pow(2, attempt + 1) * 5000;
-        log('⏳', `Gemini 429 — backing off ${(wait / 1000).toFixed(0)}s (attempt ${attempt + 1}/${retries})`);
+        log('⏳', `Gemini 429 — backing off ${(wait / 1000).toFixed(0)}s`);
         await sleep(wait);
         continue;
       }
-
-      if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(`${res.status}: ${errText.substring(0, 300)}`);
-      }
+      if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).substring(0, 200)}`);
 
       const data = await res.json();
       const raw  = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
       const parsed = repairJSON(raw);
 
-      if (!Array.isArray(parsed)) {
-        throw new Error(`Expected array, got ${typeof parsed}`);
-      }
-      // Accept if length is close (Gemini sometimes drops the last one)
-      if (parsed.length < items.length) {
-        log('  ', `Gemini returned ${parsed.length}/${items.length} — padding with nulls`);
-        while (parsed.length < items.length) parsed.push(null);
-      }
+      if (!Array.isArray(parsed)) throw new Error(`Expected array, got ${typeof parsed}`);
+      while (parsed.length < items.length) parsed.push(null);
 
       return parsed.map((p, idx) => validateEnrichment(p, items[idx].hint));
 
     } catch (err) {
       if (attempt === retries) {
-        // ── Fallback: enrich individually ──────────────────────────
-        log('⚠️', `Batch parse failed (${err.message.substring(0, 80)}) — falling back to individual calls`);
+        log('⚠️', `Batch parse failed — falling back to individual calls`);
         const results = [];
         for (const item of items) {
-          const result = await enrichOneWithGemini(item);
-          results.push(result);
+          results.push(await enrichOneWithGemini(item));
           await sleep(300);
         }
         return results;
@@ -409,7 +446,7 @@ async function enrichBatchWithGemini(items, retries = 2) {
 
 // ─────────────────────────── Contributors ────────────────────────────
 
-const contributorCache = new Map(); // github_username → uuid
+const contributorCache = new Map();
 
 async function ensureContributor(repo) {
   const username = repo.owner.login;
@@ -425,23 +462,15 @@ async function ensureContributor(repo) {
   try {
     const result = await sbUpsert('contributors', [row], 'github_username');
     const id = result?.[0]?.id;
-    if (id) {
-      contributorCache.set(username, id);
-      return id;
-    }
+    if (id) { contributorCache.set(username, id); return id; }
   } catch (err) {
-    // contributor might already exist — try to fetch
-    log('  ', `Contributor upsert issue for ${username}: ${err.message.substring(0, 100)}`);
+    log('  ', `Contributor issue for ${username}: ${err.message.substring(0, 80)}`);
   }
 
-  // Fallback: fetch existing
   try {
     const existing = await sbGet('contributors', `github_username=eq.${encodeURIComponent(username)}&select=id&limit=1`);
-    if (existing?.[0]?.id) {
-      contributorCache.set(username, existing[0].id);
-      return existing[0].id;
-    }
-  } catch (e) { /* ignore */ }
+    if (existing?.[0]?.id) { contributorCache.set(username, existing[0].id); return existing[0].id; }
+  } catch { /* ignore */ }
 
   return null;
 }
@@ -454,7 +483,6 @@ function buildArtifact(repo, enrichment, typeHint, readme, contributorId) {
   const catLabel = e.category || 'AI / ML';
   const catSlug  = CATEGORY_LABEL_TO_SLUG[catLabel] || 'ai-ml';
 
-  // Compute trending score
   const stars = repo.stargazers_count || 0;
   const forks = repo.forks_count || 0;
   const daysAgo = (Date.now() - new Date(repo.updated_at).getTime()) / 86400000;
@@ -463,21 +491,17 @@ function buildArtifact(repo, enrichment, typeHint, readme, contributorId) {
   const recencyScore = daysAgo < 14 ? 20 : daysAgo < 30 ? 15 : daysAgo < 90 ? 8 : 0;
   const trendingScore = Math.min(100, starScore + forkScore + recencyScore);
 
-  // Generate slug from full_name
   const slug = repo.full_name.replace('/', '-').toLowerCase().replace(/[^a-z0-9-]/g, '');
-
-  // Resolve UUIDs
   const artifactTypeId = TYPE_MAP[typeSlug];
   const categoryId     = CATEGORY_MAP[catSlug];
 
   if (!artifactTypeId) {
-    log('⚠️', `Unknown type slug "${typeSlug}" for ${repo.full_name} — skipping`);
+    log('⚠️', `Unknown type "${typeSlug}" for ${repo.full_name} — skipping`);
     return null;
   }
 
   return {
-    slug,
-    name:                   repo.name,
+    slug, name: repo.name,
     description:            (repo.description || '').substring(0, 500),
     long_description:       (e.long_description || repo.description || '').substring(0, 2000),
     artifact_type_id:       artifactTypeId,
@@ -490,8 +514,7 @@ function buildArtifact(repo, enrichment, typeHint, readme, contributorId) {
     license:                repo.license?.spdx_id || repo.license?.name || null,
     install_command:        e.install_command || `npx skills add ${repo.full_name}`,
     npm_package_name:       e.npm_package_name || null,
-    stars:                  stars,
-    forks:                  forks,
+    stars, forks,
     open_issues:            repo.open_issues_count || 0,
     weekly_downloads:       0,
     trending_score:         trendingScore,
@@ -508,10 +531,8 @@ function buildArtifact(repo, enrichment, typeHint, readme, contributorId) {
     github_created_at:      repo.created_at,
     github_updated_at:      repo.updated_at,
     last_pipeline_sync:     new Date().toISOString(),
-    // Transient — used after upsert for junction table, not sent to artifacts
     _platform_labels:       Array.isArray(e.compatible_platforms) && e.compatible_platforms.length
-                              ? e.compatible_platforms
-                              : (PLATFORM_DEFAULTS[typeSlug] || []),
+                              ? e.compatible_platforms : (PLATFORM_DEFAULTS[typeSlug] || []),
     _type_slug:             typeSlug,
   };
 }
@@ -522,8 +543,6 @@ async function upsertArtifacts(artifacts) {
   let upserted = 0;
   for (let start = 0; start < artifacts.length; start += BATCH_SIZE) {
     const batch = artifacts.slice(start, start + BATCH_SIZE);
-
-    // Strip transient fields before sending to Supabase
     const rows = batch.map(a => {
       const { _platform_labels, _type_slug, ...row } = a;
       return row;
@@ -533,166 +552,196 @@ async function upsertArtifacts(artifacts) {
       const result = await sbUpsert('artifacts', rows, 'github_repo_full_name');
       upserted += result.length;
 
-      // Now handle artifact_platforms junction for returned rows
       for (let i = 0; i < result.length; i++) {
         const artifactId = result[i].id;
         const labels = batch[i]._platform_labels || [];
-        const junctionRows = [];
-
-        for (const label of labels) {
-          const platform = PLATFORM_MAP[label];
-          if (platform) {
-            junctionRows.push({ artifact_id: artifactId, platform_id: platform.id });
-          }
-        }
+        const junctionRows = labels
+          .map(l => PLATFORM_MAP[l]).filter(Boolean)
+          .map(p => ({ artifact_id: artifactId, platform_id: p.id }));
 
         if (junctionRows.length > 0) {
-          try {
-            await sbUpsert('artifact_platforms', junctionRows, 'artifact_id,platform_id');
-          } catch (err) {
-            log('  ', `Junction upsert issue for ${result[i].slug}: ${err.message.substring(0, 100)}`);
-          }
+          try { await sbUpsert('artifact_platforms', junctionRows, 'artifact_id,platform_id'); }
+          catch (err) { log('  ', `Junction issue for ${result[i].slug}: ${err.message.substring(0, 80)}`); }
         }
       }
-
-      log('💾', `Batch ${Math.floor(start / BATCH_SIZE) + 1}: ${result.length} rows (${upserted} total)`);
+      log('💾', `Batch upserted: ${result.length} (${upserted} total)`);
     } catch (err) {
-      log('❌', `Batch failed: ${err.message.substring(0, 200)}`);
-      // Fallback: try one-by-one
+      log('❌', `Batch failed: ${err.message.substring(0, 150)}`);
       for (let j = 0; j < rows.length; j++) {
         try {
           const result = await sbUpsert('artifacts', [rows[j]], 'github_repo_full_name');
           upserted++;
-
-          // Junction
           const artifactId = result?.[0]?.id;
           if (artifactId) {
             const labels = batch[j]._platform_labels || [];
-            const junctionRows = labels
-              .map(l => PLATFORM_MAP[l])
-              .filter(Boolean)
+            const junctionRows = labels.map(l => PLATFORM_MAP[l]).filter(Boolean)
               .map(p => ({ artifact_id: artifactId, platform_id: p.id }));
             if (junctionRows.length) {
               try { await sbUpsert('artifact_platforms', junctionRows, 'artifact_id,platform_id'); }
-              catch (e) { /* ignore */ }
+              catch { /* ignore */ }
             }
           }
-        } catch (e2) {
-          log('  ', `Skip: ${e2.message.substring(0, 100)}`);
-        }
+        } catch (e2) { log('  ', `Skip: ${e2.message.substring(0, 80)}`); }
       }
     }
   }
   return upserted;
 }
 
-// ─────────────────────────── Main ────────────────────────────────────
+// ─────────────────────────── Enrich + upsert a chunk ────────────────
+// Shared between bulk and incremental modes
 
-async function main() {
-  const startTime = Date.now();
-  validateEnv();
-
-  // ── 0. Load lookup tables from Supabase ─────────────────────────────
-  await loadLookups();
-
-  // ── 1. Discover repos from GitHub ───────────────────────────────────
-  log('🔍', `\nStarting discovery — ${SEARCH_QUERIES.length} search queries\n`);
-
-  /** @type {Map<string, { repo: object, hint: string }>} */
-  const repoMap = new Map();
-  let searchesRun = 0;
-
-  for (const { hint, q, sort, pages } of SEARCH_QUERIES) {
-    if (repoMap.size >= MAX_REPOS) {
-      log('📦', `Hit ${MAX_REPOS} cap — stopping search`);
-      break;
-    }
-
-    log('🔎', `[${hint}] ${q} (${pages}p)`);
-    const repos = await searchRepos(q, sort, pages);
-    searchesRun++;
-
-    let added = 0;
-    for (const repo of repos) {
-      if (repoMap.size >= MAX_REPOS) break;
-      const key = repo.full_name;
-      if (!repoMap.has(key)) {
-        repoMap.set(key, { repo, hint });
-        added++;
-      }
-    }
-    log('  ', `→ ${repos.length} results, ${added} new (${repoMap.size} total)`);
-    await sleep(2500);
-  }
-
-  log('📊', `\nDiscovery complete: ${repoMap.size} unique repos from ${searchesRun} queries\n`);
-
-  // ── 2. Fetch READMEs & enrich in batches via Gemini ─────────────────
-  const artifacts = [];
+async function enrichAndUpsert(repoMap) {
   const entries = [...repoMap.entries()];
+  if (!entries.length) return 0;
 
-  // Phase 2a: Fetch all READMEs (parallel-ish, respecting rate limits)
-  log('📖', `\nFetching READMEs for ${entries.length} repos\n`);
+  // Fetch READMEs
+  log('📖', `Fetching READMEs for ${entries.length} repos`);
   const readmeMap = new Map();
   for (let i = 0; i < entries.length; i++) {
     const [key, { repo }] = entries[i];
-    if (i > 0 && i % 20 === 0) log('  ', `READMEs: ${i}/${entries.length}`);
-    const readme = await fetchReadme(repo.owner.login, repo.name);
-    readmeMap.set(key, readme);
-    await sleep(400);
+    if (i > 0 && i % 50 === 0) log('  ', `READMEs: ${i}/${entries.length}`);
+    readmeMap.set(key, await fetchReadme(repo.owner.login, repo.name));
+    await sleep(350);
   }
-  log('📖', `Fetched ${readmeMap.size} READMEs`);
 
-  // Phase 2b: Enrich in batches (GEMINI_BATCH repos per API call)
-  log('🤖', `\nEnriching via Gemini (${GEMINI_BATCH} repos/call → ~${Math.ceil(entries.length / GEMINI_BATCH)} calls)\n`);
+  // Enrich via Gemini in batches
+  log('🤖', `Enriching via Gemini (${GEMINI_BATCH}/call → ~${Math.ceil(entries.length / GEMINI_BATCH)} calls)`);
+  const artifacts = [];
 
   for (let start = 0; start < entries.length; start += GEMINI_BATCH) {
     const chunk = entries.slice(start, start + GEMINI_BATCH);
-    const batchNum = Math.floor(start / GEMINI_BATCH) + 1;
-    const totalBatches = Math.ceil(entries.length / GEMINI_BATCH);
-    log('🔄', `Gemini batch ${batchNum}/${totalBatches} (repos ${start + 1}–${start + chunk.length})`);
-
-    // Prepare batch items for Gemini
     const batchItems = chunk.map(([key, { repo, hint }]) => ({
       repo, hint, readme: readmeMap.get(key),
     }));
 
-    // Single Gemini call for the whole batch
     const enrichments = await enrichBatchWithGemini(batchItems);
-    await sleep(1000);
+    await sleep(800);
 
-    // Build artifacts from enrichments
     for (let j = 0; j < chunk.length; j++) {
       const [key, { repo, hint }] = chunk[j];
-      const enrichment = enrichments[j];
-      const readme = readmeMap.get(key);
-
       const contributorId = await ensureContributor(repo);
-      const artifact = buildArtifact(repo, enrichment, hint, readme, contributorId);
-      if (artifact) {
-        artifacts.push(artifact);
-        log('  ', `→ ${key}: ${artifact._type_slug} | score ${artifact.trending_score} | ${artifact._platform_labels.length} platforms`);
-      }
+      const artifact = buildArtifact(repo, enrichments[j], hint, readmeMap.get(key), contributorId);
+      if (artifact) artifacts.push(artifact);
     }
   }
 
-  log('✅', `\nEnriched ${artifacts.length} artifacts\n`);
+  log('✅', `Enriched ${artifacts.length} artifacts — upserting to Supabase`);
+  return await upsertArtifacts(artifacts);
+}
 
-  // ── 3. Upsert to Supabase ──────────────────────────────────────────
-  const upserted = await upsertArtifacts(artifacts);
+// ─────────────────────────── Discovery (with bucketing) ─────────────
 
-  // ── 4. Summary ─────────────────────────────────────────────────────
-  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  const typeCount = {};
-  for (const a of artifacts) typeCount[a._type_slug] = (typeCount[a._type_slug] || 0) + 1;
+async function discoverRepos(queries, existingRepoMap, cap) {
+  const repoMap = existingRepoMap || new Map();
+  let searchesRun = 0;
 
-  log('🏁', `\nDone in ${elapsed}s`);
-  log('  ', `Repos discovered:    ${repoMap.size}`);
-  log('  ', `Artifacts upserted:  ${upserted}`);
-  log('  ', `By type:`);
-  for (const [t, c] of Object.entries(typeCount).sort((a, b) => b[1] - a[1])) {
-    log('  ', `  ${t}: ${c}`);
+  for (const queryDef of queries) {
+    if (cap && repoMap.size >= cap) {
+      log('📦', `Hit ${cap} cap — stopping search`);
+      break;
+    }
+
+    const { hint, q, sort, pages, bucketed } = queryDef;
+    const buckets = bucketed ? STAR_BUCKETS : [''];
+
+    for (const bucket of buckets) {
+      if (cap && repoMap.size >= cap) break;
+
+      const fullQuery = bucket ? `${q} ${bucket}` : q;
+      const maxPages = Math.min(pages, 34);
+
+      log('🔎', `[${hint}] ${fullQuery} (${maxPages}p)`);
+      const repos = await searchRepos(fullQuery, sort, maxPages);
+      searchesRun++;
+
+      let added = 0;
+      for (const repo of repos) {
+        if (cap && repoMap.size >= cap) break;
+        const key = repo.full_name;
+        if (!repoMap.has(key)) {
+          repoMap.set(key, { repo, hint });
+          added++;
+        }
+      }
+      log('  ', `→ ${repos.length} results, ${added} new (${repoMap.size} total)`);
+      await sleep(2500);
+
+      // If this bucket returned fewer than a full page, skip remaining buckets
+      if (repos.length < 30) continue;
+    }
   }
+
+  log('📊', `Discovery: ${repoMap.size} unique repos from ${searchesRun} queries`);
+  return repoMap;
+}
+
+// ─────────────────────────── Main: INCREMENTAL mode ─────────────────
+
+async function runIncremental() {
+  log('🔄', `\n═══ INCREMENTAL MODE — cap ${INCREMENTAL_CAP} repos ═══\n`);
+
+  // Use "updated" sort + pushed:>DATE to find recently changed repos
+  const since = new Date(Date.now() - 4 * 3600 * 1000).toISOString().split('T')[0];
+  const incrementalQueries = SEARCH_QUERIES.map(sq => ({
+    ...sq,
+    // For incremental: fewer pages, sort by recently updated
+    pages: Math.min(sq.pages, 5),
+    bucketed: false,
+    sort: 'updated',
+    q: `${sq.q} pushed:>=${since}`,
+  }));
+
+  const repoMap = await discoverRepos(incrementalQueries, new Map(), INCREMENTAL_CAP);
+  if (repoMap.size === 0) {
+    log('✅', 'No new/updated repos found since last run');
+    return;
+  }
+
+  const upserted = await enrichAndUpsert(repoMap);
+  log('🏁', `Incremental done: ${upserted} artifacts upserted`);
+}
+
+// ─────────────────────────── Main: BULK mode ────────────────────────
+
+async function runBulk() {
+  log('📦', `\n═══ BULK MODE — full index, no cap ═══\n`);
+
+  // Process all queries, using star buckets for bucketed ones
+  const repoMap = await discoverRepos(SEARCH_QUERIES, new Map(), 0);
+
+  log('📊', `\nTotal unique repos discovered: ${repoMap.size}\n`);
+
+  // Process in chunks to avoid OOM and allow progress logging
+  const CHUNK = 200;
+  const entries = [...repoMap.entries()];
+  let totalUpserted = 0;
+
+  for (let start = 0; start < entries.length; start += CHUNK) {
+    const chunk = entries.slice(start, start + CHUNK);
+    const chunkMap = new Map(chunk);
+    log('🔄', `\nProcessing chunk ${Math.floor(start / CHUNK) + 1}/${Math.ceil(entries.length / CHUNK)} (repos ${start + 1}–${start + chunk.length})\n`);
+    totalUpserted += await enrichAndUpsert(chunkMap);
+  }
+
+  log('🏁', `Bulk done: ${totalUpserted} artifacts upserted from ${repoMap.size} repos`);
+}
+
+// ─────────────────────────── Entry point ────────────────────────────
+
+async function main() {
+  const startTime = Date.now();
+  validateEnv();
+  await loadLookups();
+
+  if (MODE === 'bulk') {
+    await runBulk();
+  } else {
+    await runIncremental();
+  }
+
+  const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
+  log('⏱️', `Total time: ${elapsed} min`);
 }
 
 main().catch((err) => {
