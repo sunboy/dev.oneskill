@@ -20,10 +20,11 @@
 
 // ─────────────────────────── Configuration ───────────────────────────
 
-const MAX_REPOS    = 150;
-const BATCH_SIZE   = 20;
-const GEMINI_MODEL = 'gemini-2.0-flash';
-const GEMINI_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+const MAX_REPOS        = 150;
+const BATCH_SIZE       = 20;
+const GEMINI_BATCH     = 10;   // repos per Gemini call (~10x fewer API calls)
+const GEMINI_MODEL     = 'gemini-2.5-flash';
+const GEMINI_URL       = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
 // ─────────────────────────── Search Queries ──────────────────────────
 // hint = slug that maps to artifact_types.slug
@@ -234,25 +235,31 @@ const GEMINI_PLATFORMS  = [
   'Toolhouse', 'Browserbase', 'Steel', 'Firecrawl', 'Apify', 'Julep', 'Letta',
 ];
 
-async function enrichWithGemini(repo, readme, typeHint, retries = 2) {
-  const readmeExcerpt = readme ? readme.substring(0, 2500) : 'No README found.';
+/**
+ * Enrich a batch of repos in a SINGLE Gemini call.
+ * @param {Array<{ repo: object, readme: string|null, hint: string }>} items
+ * @returns {Promise<Array<object|null>>}  enrichment per item (same order)
+ */
+async function enrichBatchWithGemini(items, retries = 2) {
+  // Build per-repo summaries (keep each compact to fit context)
+  const repoSummaries = items.map((item, idx) => {
+    const r = item.repo;
+    const excerpt = item.readme ? item.readme.substring(0, 1800) : 'No README.';
+    return `### REPO_${idx}
+- full_name: ${r.full_name}
+- description: ${r.description || '(none)'}
+- language: ${r.language || 'Unknown'}
+- stars: ${r.stargazers_count} | forks: ${r.forks_count}
+- topics: ${(r.topics || []).join(', ') || '(none)'}
+- updated: ${r.updated_at}
+README excerpt:
+${excerpt}
+`;
+  }).join('\n');
 
-  const prompt = `You are classifying a GitHub repository as an "agent artifact" for an open directory called OneSkill. Analyze the repository and return a single JSON object — no markdown fences, no explanation, only the JSON.
+  const prompt = `You are classifying ${items.length} GitHub repositories as "agent artifacts" for OneSkill.dev. Analyze each and return a JSON ARRAY of ${items.length} objects — one per repo, same order. No markdown fences, no explanation, ONLY the JSON array.
 
-## Repository
-- Owner: ${repo.owner.login}
-- Name: ${repo.name}
-- Full name: ${repo.full_name}
-- Description: ${repo.description || '(none)'}
-- Language: ${repo.language || 'Unknown'}
-- Stars: ${repo.stargazers_count}
-- Forks: ${repo.forks_count}
-- Topics: ${(repo.topics || []).join(', ') || '(none)'}
-- Updated: ${repo.updated_at}
-- Created: ${repo.created_at}
-
-## README excerpt (first 2500 chars)
-${readmeExcerpt}
+${repoSummaries}
 
 ## Classification rules
 artifact_type must be EXACTLY one of: skill, mcp-server, cursor-rules, n8n-node, workflow, langchain-tool, crewai-tool
@@ -261,34 +268,21 @@ compatible_platforms must be a subset of: ${GEMINI_PLATFORMS.join(', ')}
 tags: 3–7 lowercase hyphenated keywords (e.g. "web-scraping", "auth", "react")
 
 Heuristics for artifact_type:
-- MCP server: implements Model Context Protocol, exposes tools/resources via MCP, has "mcp" in name/topics, or has mcp.json → "mcp-server"
+- MCP server: implements Model Context Protocol, exposes tools/resources via MCP, has "mcp" in name/topics → "mcp-server"
 - Cursor rules: contains .cursorrules files, is a collection of cursor rules → "cursor-rules"
-- Skill: has SKILL.md, meant for "npx skills add", teaches an agent how to do tasks → "skill"
-- n8n node: is an n8n community node (package name starts with n8n-nodes-) → "n8n-node"
-- Workflow: chains multiple agents, automation steps, pipeline/orchestration → "workflow"
-- LangChain tool: extends LangChain with custom tools, retrievers, chains → "langchain-tool"
+- Skill: has SKILL.md, meant for "npx skills add", teaches an agent → "skill"
+- n8n node: n8n community node (package name starts with n8n-nodes-) → "n8n-node"
+- Workflow: chains agents, automation pipeline/orchestration → "workflow"
+- LangChain tool: extends LangChain with custom tools, retrievers → "langchain-tool"
 - CrewAI tool: extends CrewAI with tools, agents, tasks → "crewai-tool"
 
-Install command:
-- MCP servers on npm: "npx <package-name>" or "npx -y <package-name>"
-- Skills: "npx skills add <owner>/<repo>"
-- pip packages: "pip install <package-name>"
-- Cursor rules: "curl -o .cursorrules <raw-url>"
-- n8n nodes: "npm install <package-name>"
-- If unsure: "npx skills add ${repo.full_name}"
+Install command patterns:
+- MCP/npm: "npx -y <package-name>" | Skills: "npx skills add <owner>/<repo>"
+- pip: "pip install <package-name>" | Cursor: "curl -o .cursorrules <raw-url>"
+- n8n: "npm install <package-name>" | Default: "npx skills add <full_name>"
 
-## Required JSON shape (return ONLY this)
-{
-  "artifact_type": "...",
-  "long_description": "2-3 sentences about what this does and why it's useful.",
-  "category": "...",
-  "tags": ["...", "..."],
-  "compatible_platforms": ["...", "..."],
-  "install_command": "...",
-  "npm_package_name": null,
-  "meta_title": "short SEO title (under 60 chars)",
-  "meta_description": "SEO description (under 160 chars)"
-}`;
+Return a JSON array of exactly ${items.length} objects, each shaped:
+{ "artifact_type": "...", "long_description": "2-3 sentences.", "category": "...", "tags": [...], "compatible_platforms": [...], "install_command": "...", "npm_package_name": null, "meta_title": "under 60 chars", "meta_description": "under 160 chars" }`;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
@@ -297,55 +291,56 @@ Install command:
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.15, maxOutputTokens: 800 },
+          generationConfig: { temperature: 0.15, maxOutputTokens: items.length * 400 },
         }),
       });
 
       if (res.status === 429) {
         const wait = Math.pow(2, attempt + 1) * 5000;
-        log('⏳', `Gemini 429 — backing off ${(wait / 1000).toFixed(0)}s (attempt ${attempt + 1})`);
+        log('⏳', `Gemini 429 — backing off ${(wait / 1000).toFixed(0)}s (attempt ${attempt + 1}/${retries})`);
         await sleep(wait);
         continue;
       }
 
       if (!res.ok) {
         const errText = await res.text();
-        throw new Error(`${res.status}: ${errText.substring(0, 200)}`);
+        throw new Error(`${res.status}: ${errText.substring(0, 300)}`);
       }
 
       const data = await res.json();
       const raw  = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      const match = raw.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error('No JSON in Gemini response');
 
-      const parsed = JSON.parse(match[0]);
+      // Extract JSON array from response
+      const arrayMatch = raw.match(/\[[\s\S]*\]/);
+      if (!arrayMatch) throw new Error('No JSON array in Gemini response');
 
-      // Validate artifact_type against known slugs
+      const parsed = JSON.parse(arrayMatch[0]);
+      if (!Array.isArray(parsed) || parsed.length !== items.length) {
+        throw new Error(`Expected array of ${items.length}, got ${Array.isArray(parsed) ? parsed.length : typeof parsed}`);
+      }
+
+      // Validate each result
       const validTypes = ['skill', 'mcp-server', 'cursor-rules', 'n8n-node', 'workflow', 'langchain-tool', 'crewai-tool'];
-      if (!validTypes.includes(parsed.artifact_type)) {
-        parsed.artifact_type = typeHint;
-      }
-      // Validate category
-      if (!GEMINI_CATEGORIES.includes(parsed.category)) {
-        parsed.category = 'AI / ML';
-      }
-      // Filter platforms
-      if (Array.isArray(parsed.compatible_platforms)) {
-        parsed.compatible_platforms = parsed.compatible_platforms.filter((p) =>
-          GEMINI_PLATFORMS.includes(p)
-        );
-      }
+      return parsed.map((p, idx) => {
+        if (!p || typeof p !== 'object') return null;
+        if (!validTypes.includes(p.artifact_type)) p.artifact_type = items[idx].hint;
+        if (!GEMINI_CATEGORIES.includes(p.category)) p.category = 'AI / ML';
+        if (Array.isArray(p.compatible_platforms)) {
+          p.compatible_platforms = p.compatible_platforms.filter(pl => GEMINI_PLATFORMS.includes(pl));
+        }
+        return p;
+      });
 
-      return parsed;
     } catch (err) {
       if (attempt === retries) {
-        log('⚠️', `Gemini failed for ${repo.full_name}: ${err.message}`);
-        return null;
+        log('⚠️', `Gemini batch failed: ${err.message.substring(0, 200)}`);
+        return items.map(() => null);   // return nulls so pipeline continues
       }
+      log('  ', `Gemini retry ${attempt + 1}: ${err.message.substring(0, 100)}`);
       await sleep(3000);
     }
   }
-  return null;
+  return items.map(() => null);
 }
 
 // ─────────────────────────── Contributors ────────────────────────────
@@ -568,31 +563,52 @@ async function main() {
 
   log('📊', `\nDiscovery complete: ${repoMap.size} unique repos from ${searchesRun} queries\n`);
 
-  // ── 2. Enrich & build artifacts ─────────────────────────────────────
+  // ── 2. Fetch READMEs & enrich in batches via Gemini ─────────────────
   const artifacts = [];
-  let i = 0;
+  const entries = [...repoMap.entries()];
 
-  for (const [key, { repo, hint }] of repoMap) {
-    i++;
-    const pct = ((i / repoMap.size) * 100).toFixed(0);
-    log('🔄', `[${i}/${repoMap.size}] (${pct}%) ${key}`);
-
-    // Fetch README
+  // Phase 2a: Fetch all READMEs (parallel-ish, respecting rate limits)
+  log('📖', `\nFetching READMEs for ${entries.length} repos\n`);
+  const readmeMap = new Map();
+  for (let i = 0; i < entries.length; i++) {
+    const [key, { repo }] = entries[i];
+    if (i > 0 && i % 20 === 0) log('  ', `READMEs: ${i}/${entries.length}`);
     const readme = await fetchReadme(repo.owner.login, repo.name);
-    await sleep(600);
+    readmeMap.set(key, readme);
+    await sleep(400);
+  }
+  log('📖', `Fetched ${readmeMap.size} READMEs`);
 
-    // Enrich via Gemini
-    const enrichment = await enrichWithGemini(repo, readme, hint);
-    await sleep(500);
+  // Phase 2b: Enrich in batches (GEMINI_BATCH repos per API call)
+  log('🤖', `\nEnriching via Gemini (${GEMINI_BATCH} repos/call → ~${Math.ceil(entries.length / GEMINI_BATCH)} calls)\n`);
 
-    // Ensure contributor exists
-    const contributorId = await ensureContributor(repo);
+  for (let start = 0; start < entries.length; start += GEMINI_BATCH) {
+    const chunk = entries.slice(start, start + GEMINI_BATCH);
+    const batchNum = Math.floor(start / GEMINI_BATCH) + 1;
+    const totalBatches = Math.ceil(entries.length / GEMINI_BATCH);
+    log('🔄', `Gemini batch ${batchNum}/${totalBatches} (repos ${start + 1}–${start + chunk.length})`);
 
-    // Build artifact row
-    const artifact = buildArtifact(repo, enrichment, hint, readme, contributorId);
-    if (artifact) {
-      artifacts.push(artifact);
-      log('  ', `→ ${artifact._type_slug} | score ${artifact.trending_score} | ${artifact._platform_labels.length} platforms`);
+    // Prepare batch items for Gemini
+    const batchItems = chunk.map(([key, { repo, hint }]) => ({
+      repo, hint, readme: readmeMap.get(key),
+    }));
+
+    // Single Gemini call for the whole batch
+    const enrichments = await enrichBatchWithGemini(batchItems);
+    await sleep(1000);
+
+    // Build artifacts from enrichments
+    for (let j = 0; j < chunk.length; j++) {
+      const [key, { repo, hint }] = chunk[j];
+      const enrichment = enrichments[j];
+      const readme = readmeMap.get(key);
+
+      const contributorId = await ensureContributor(repo);
+      const artifact = buildArtifact(repo, enrichment, hint, readme, contributorId);
+      if (artifact) {
+        artifacts.push(artifact);
+        log('  ', `→ ${key}: ${artifact._type_slug} | score ${artifact.trending_score} | ${artifact._platform_labels.length} platforms`);
+      }
     }
   }
 
