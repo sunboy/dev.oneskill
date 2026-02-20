@@ -235,13 +235,42 @@ const GEMINI_PLATFORMS  = [
   'Toolhouse', 'Browserbase', 'Steel', 'Firecrawl', 'Apify', 'Julep', 'Letta',
 ];
 
-/**
- * Enrich a batch of repos in a SINGLE Gemini call.
- * @param {Array<{ repo: object, readme: string|null, hint: string }>} items
- * @returns {Promise<Array<object|null>>}  enrichment per item (same order)
- */
-async function enrichBatchWithGemini(items, retries = 2) {
-  // Build per-repo summaries (keep each compact to fit context)
+// ─── JSON repair helper ─────────────────────────────────────────────
+// Gemini sometimes outputs malformed JSON (unescaped quotes in strings,
+// trailing commas, etc.).  This attempts lightweight fixes before giving up.
+function repairJSON(raw) {
+  let s = raw;
+  // Strip markdown fences
+  s = s.replace(/^```(?:json)?\s*/gm, '').replace(/```\s*$/gm, '');
+  // Remove trailing commas before ] or }
+  s = s.replace(/,\s*([\]}])/g, '$1');
+  // Try parsing as-is first
+  try { return JSON.parse(s); } catch (_) { /* continue */ }
+  // Try extracting just the array
+  const m = s.match(/\[[\s\S]*\]/);
+  if (m) { try { return JSON.parse(m[0]); } catch (_) { /* continue */ } }
+  // Last resort: aggressive newline / control char cleanup inside strings
+  s = s.replace(/[\x00-\x1f]/g, (ch) => ch === '\n' ? '\\n' : ch === '\t' ? '\\t' : '');
+  const m2 = s.match(/\[[\s\S]*\]/);
+  if (m2) { return JSON.parse(m2[0]); }
+  throw new Error('JSON repair failed');
+}
+
+// ─── Validate one Gemini enrichment result ──────────────────────────
+const VALID_TYPES = ['skill', 'mcp-server', 'cursor-rules', 'n8n-node', 'workflow', 'langchain-tool', 'crewai-tool'];
+
+function validateEnrichment(p, hint) {
+  if (!p || typeof p !== 'object') return null;
+  if (!VALID_TYPES.includes(p.artifact_type)) p.artifact_type = hint;
+  if (!GEMINI_CATEGORIES.includes(p.category)) p.category = 'AI / ML';
+  if (Array.isArray(p.compatible_platforms)) {
+    p.compatible_platforms = p.compatible_platforms.filter(pl => GEMINI_PLATFORMS.includes(pl));
+  }
+  return p;
+}
+
+// ─── Build the Gemini prompt for N repos ────────────────────────────
+function buildGeminiPrompt(items) {
   const repoSummaries = items.map((item, idx) => {
     const r = item.repo;
     const excerpt = item.readme ? item.readme.substring(0, 1800) : 'No README.';
@@ -253,11 +282,10 @@ async function enrichBatchWithGemini(items, retries = 2) {
 - topics: ${(r.topics || []).join(', ') || '(none)'}
 - updated: ${r.updated_at}
 README excerpt:
-${excerpt}
-`;
-  }).join('\n');
+${excerpt}`;
+  }).join('\n\n');
 
-  const prompt = `You are classifying ${items.length} GitHub repositories as "agent artifacts" for OneSkill.dev. Analyze each and return a JSON ARRAY of ${items.length} objects — one per repo, same order. No markdown fences, no explanation, ONLY the JSON array.
+  return `You are classifying ${items.length} GitHub repositories as "agent artifacts" for OneSkill.dev. Return ONLY a valid JSON array of ${items.length} objects — one per repo, same order. No markdown fences, no extra text.
 
 ${repoSummaries}
 
@@ -267,22 +295,56 @@ category must be EXACTLY one of: ${GEMINI_CATEGORIES.join(', ')}
 compatible_platforms must be a subset of: ${GEMINI_PLATFORMS.join(', ')}
 tags: 3–7 lowercase hyphenated keywords (e.g. "web-scraping", "auth", "react")
 
-Heuristics for artifact_type:
-- MCP server: implements Model Context Protocol, exposes tools/resources via MCP, has "mcp" in name/topics → "mcp-server"
-- Cursor rules: contains .cursorrules files, is a collection of cursor rules → "cursor-rules"
-- Skill: has SKILL.md, meant for "npx skills add", teaches an agent → "skill"
-- n8n node: n8n community node (package name starts with n8n-nodes-) → "n8n-node"
-- Workflow: chains agents, automation pipeline/orchestration → "workflow"
-- LangChain tool: extends LangChain with custom tools, retrievers → "langchain-tool"
-- CrewAI tool: extends CrewAI with tools, agents, tasks → "crewai-tool"
+Heuristics:
+- MCP server → "mcp-server"  |  Cursor rules → "cursor-rules"  |  Skill (SKILL.md) → "skill"
+- n8n community node → "n8n-node"  |  Workflow/orchestration → "workflow"
+- LangChain tool → "langchain-tool"  |  CrewAI tool → "crewai-tool"
 
-Install command patterns:
-- MCP/npm: "npx -y <package-name>" | Skills: "npx skills add <owner>/<repo>"
-- pip: "pip install <package-name>" | Cursor: "curl -o .cursorrules <raw-url>"
-- n8n: "npm install <package-name>" | Default: "npx skills add <full_name>"
+Install patterns: MCP/npm: "npx -y <pkg>" | Skills: "npx skills add <owner>/<repo>" | pip: "pip install <pkg>" | Cursor: "curl -o .cursorrules <url>" | n8n: "npm install <pkg>"
 
-Return a JSON array of exactly ${items.length} objects, each shaped:
-{ "artifact_type": "...", "long_description": "2-3 sentences.", "category": "...", "tags": [...], "compatible_platforms": [...], "install_command": "...", "npm_package_name": null, "meta_title": "under 60 chars", "meta_description": "under 160 chars" }`;
+Each object shape:
+{"artifact_type":"...","long_description":"2-3 sentences.","category":"...","tags":[...],"compatible_platforms":[...],"install_command":"...","npm_package_name":null,"meta_title":"under 60 chars","meta_description":"under 160 chars"}`;
+}
+
+// ─── Call Gemini for a single repo (fallback) ───────────────────────
+async function enrichOneWithGemini(item, retries = 1) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(`${GEMINI_URL}?key=${ENV.GEMINI_API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: buildGeminiPrompt([item]) }] }],
+          generationConfig: {
+            temperature: 0.15,
+            maxOutputTokens: 600,
+            responseMimeType: 'application/json',
+          },
+        }),
+      });
+      if (res.status === 429) { await sleep(Math.pow(2, attempt + 1) * 5000); continue; }
+      if (!res.ok) throw new Error(`${res.status}`);
+      const data = await res.json();
+      const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const parsed = repairJSON(raw);
+      const arr = Array.isArray(parsed) ? parsed : [parsed];
+      return validateEnrichment(arr[0], item.hint);
+    } catch (err) {
+      if (attempt === retries) return null;
+      await sleep(2000);
+    }
+  }
+  return null;
+}
+
+/**
+ * Enrich a batch of repos in a SINGLE Gemini call.
+ * Falls back to individual calls if batch JSON parsing fails.
+ * @param {Array<{ repo: object, readme: string|null, hint: string }>} items
+ * @returns {Promise<Array<object|null>>}  enrichment per item (same order)
+ */
+async function enrichBatchWithGemini(items, retries = 2) {
+  const prompt = buildGeminiPrompt(items);
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
@@ -291,7 +353,11 @@ Return a JSON array of exactly ${items.length} objects, each shaped:
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.15, maxOutputTokens: items.length * 400 },
+          generationConfig: {
+            temperature: 0.15,
+            maxOutputTokens: items.length * 400,
+            responseMimeType: 'application/json',
+          },
         }),
       });
 
@@ -309,32 +375,30 @@ Return a JSON array of exactly ${items.length} objects, each shaped:
 
       const data = await res.json();
       const raw  = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const parsed = repairJSON(raw);
 
-      // Extract JSON array from response
-      const arrayMatch = raw.match(/\[[\s\S]*\]/);
-      if (!arrayMatch) throw new Error('No JSON array in Gemini response');
-
-      const parsed = JSON.parse(arrayMatch[0]);
-      if (!Array.isArray(parsed) || parsed.length !== items.length) {
-        throw new Error(`Expected array of ${items.length}, got ${Array.isArray(parsed) ? parsed.length : typeof parsed}`);
+      if (!Array.isArray(parsed)) {
+        throw new Error(`Expected array, got ${typeof parsed}`);
+      }
+      // Accept if length is close (Gemini sometimes drops the last one)
+      if (parsed.length < items.length) {
+        log('  ', `Gemini returned ${parsed.length}/${items.length} — padding with nulls`);
+        while (parsed.length < items.length) parsed.push(null);
       }
 
-      // Validate each result
-      const validTypes = ['skill', 'mcp-server', 'cursor-rules', 'n8n-node', 'workflow', 'langchain-tool', 'crewai-tool'];
-      return parsed.map((p, idx) => {
-        if (!p || typeof p !== 'object') return null;
-        if (!validTypes.includes(p.artifact_type)) p.artifact_type = items[idx].hint;
-        if (!GEMINI_CATEGORIES.includes(p.category)) p.category = 'AI / ML';
-        if (Array.isArray(p.compatible_platforms)) {
-          p.compatible_platforms = p.compatible_platforms.filter(pl => GEMINI_PLATFORMS.includes(pl));
-        }
-        return p;
-      });
+      return parsed.map((p, idx) => validateEnrichment(p, items[idx].hint));
 
     } catch (err) {
       if (attempt === retries) {
-        log('⚠️', `Gemini batch failed: ${err.message.substring(0, 200)}`);
-        return items.map(() => null);   // return nulls so pipeline continues
+        // ── Fallback: enrich individually ──────────────────────────
+        log('⚠️', `Batch parse failed (${err.message.substring(0, 80)}) — falling back to individual calls`);
+        const results = [];
+        for (const item of items) {
+          const result = await enrichOneWithGemini(item);
+          results.push(result);
+          await sleep(300);
+        }
+        return results;
       }
       log('  ', `Gemini retry ${attempt + 1}: ${err.message.substring(0, 100)}`);
       await sleep(3000);
