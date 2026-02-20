@@ -304,14 +304,53 @@ const GEMINI_PLATFORMS  = [
 // ─── JSON repair helper ─────────────────────────────────────────────
 function repairJSON(raw) {
   let s = raw;
+
+  // 1. Strip markdown code fences
   s = s.replace(/^```(?:json)?\s*/gm, '').replace(/```\s*$/gm, '');
+
+  // 2. Fix trailing commas before ] or }
   s = s.replace(/,\s*([\]}])/g, '$1');
+
+  // 3. Try direct parse first
   try { return JSON.parse(s); } catch (_) { /* continue */ }
+
+  // 4. Extract JSON array
   const m = s.match(/\[[\s\S]*\]/);
   if (m) { try { return JSON.parse(m[0]); } catch (_) { /* continue */ } }
-  s = s.replace(/[\x00-\x1f]/g, (ch) => ch === '\n' ? '\\n' : ch === '\t' ? '\\t' : '');
-  const m2 = s.match(/\[[\s\S]*\]/);
-  if (m2) { return JSON.parse(m2[0]); }
+
+  // 5. Fix unescaped newlines/tabs inside JSON string values
+  //    Walk character by character to only escape control chars inside strings
+  let fixed = '';
+  let inString = false;
+  let escaped = false;
+  const src = m ? m[0] : s;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (escaped) { fixed += ch; escaped = false; continue; }
+    if (ch === '\\' && inString) { fixed += ch; escaped = true; continue; }
+    if (ch === '"') { inString = !inString; fixed += ch; continue; }
+    if (inString) {
+      if (ch === '\n') { fixed += '\\n'; continue; }
+      if (ch === '\r') { fixed += '\\r'; continue; }
+      if (ch === '\t') { fixed += '\\t'; continue; }
+      // Strip other control chars
+      if (ch.charCodeAt(0) < 32) continue;
+    }
+    fixed += ch;
+  }
+  // Fix trailing commas again after our edits
+  fixed = fixed.replace(/,\s*([\]}])/g, '$1');
+  try { return JSON.parse(fixed); } catch (_) { /* continue */ }
+
+  // 6. Nuclear option: strip ALL control chars except structural whitespace
+  let nuclear = src.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
+  // Escape newlines inside strings (rough heuristic)
+  nuclear = nuclear.replace(/"([^"]*?)"/g, (match) => {
+    return match.replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
+  });
+  nuclear = nuclear.replace(/,\s*([\]}])/g, '$1');
+  try { return JSON.parse(nuclear); } catch (_) { /* continue */ }
+
   throw new Error('JSON repair failed');
 }
 
