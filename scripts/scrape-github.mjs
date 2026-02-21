@@ -46,7 +46,7 @@ const ENRICH_LIMIT = ENRICH_LIMIT_ARG !== -1
 // ─────────────────────────── Configuration ───────────────────────────
 
 const BATCH_SIZE     = 20;    // Supabase upsert batch
-const GEMINI_BATCH   = 10;    // repos per Gemini call
+const GEMINI_BATCH   = 5;     // repos per Gemini call (lower = more reliable JSON)
 const GEMINI_MODEL   = 'gemini-2.5-flash';
 const GEMINI_URL     = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 const MAX_ENRICH_ATTEMPTS = 3;  // after this many failures, mark as 'skipped'
@@ -538,27 +538,50 @@ Each object shape:
 /**
  * Enrich a single raw_repo row via Gemini. Returns enrichment result or null.
  */
-async function enrichOneWithGemini(item, retries = 2) {
+async function enrichOneWithGemini(item, retries = 3) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
+      // On last attempt, drop responseMimeType to let Gemini respond freely
+      const isLastAttempt = attempt === retries;
+      const genConfig = isLastAttempt
+        ? { temperature: 0.05, maxOutputTokens: 800 }
+        : { temperature: 0.1, maxOutputTokens: 800, responseMimeType: 'application/json' };
+
       const res = await fetch(`${GEMINI_URL}?key=${ENV.GEMINI_API_KEY}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: buildGeminiPrompt([item]) }] }],
-          generationConfig: { temperature: 0.15, maxOutputTokens: 600, responseMimeType: 'application/json' },
+          generationConfig: genConfig,
         }),
       });
       if (res.status === 429) { await sleep(Math.pow(2, attempt + 1) * 5000); continue; }
-      if (!res.ok) throw new Error(`${res.status}`);
+      if (!res.ok) {
+        const errText = await res.text();
+        log('  ', `Gemini ${res.status} for ${item.full_name}: ${errText.substring(0, 150)}`);
+        throw new Error(`${res.status}`);
+      }
       const data = await res.json();
+
+      // Check for blocked/empty responses
+      const finishReason = data.candidates?.[0]?.finishReason;
+      if (finishReason && finishReason !== 'STOP') {
+        log('  ', `Gemini finish=${finishReason} for ${item.full_name}`);
+      }
+
       const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      if (!raw) {
+        log('  ', `Gemini returned empty text for ${item.full_name}`);
+        throw new Error('Empty response');
+      }
+
       const parsed = repairJSON(raw);
       const arr = Array.isArray(parsed) ? parsed : [parsed];
       return validateEnrichment(arr[0], item.type_hint);
     } catch (err) {
+      log('  ', `[1x1] attempt ${attempt + 1}/${retries + 1} for ${item.full_name}: ${err.message.substring(0, 80)}`);
       if (attempt === retries) return null;
-      await sleep(2000);
+      await sleep(3000);
     }
   }
   return null;
@@ -570,6 +593,7 @@ async function enrichOneWithGemini(item, retries = 2) {
  */
 async function enrichBatchWithGemini(items, retries = 2) {
   const prompt = buildGeminiPrompt(items);
+  const repoNames = items.map(i => i.full_name).join(', ');
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
@@ -578,7 +602,7 @@ async function enrichBatchWithGemini(items, retries = 2) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.15, maxOutputTokens: items.length * 400, responseMimeType: 'application/json' },
+          generationConfig: { temperature: 0.1, maxOutputTokens: items.length * 500, responseMimeType: 'application/json' },
         }),
       });
 
@@ -588,29 +612,51 @@ async function enrichBatchWithGemini(items, retries = 2) {
         await sleep(wait);
         continue;
       }
-      if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).substring(0, 200)}`);
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`HTTP ${res.status}: ${errText.substring(0, 200)}`);
+      }
 
       const data = await res.json();
-      const raw  = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+      // Check for blocked/filtered responses
+      const finishReason = data.candidates?.[0]?.finishReason;
+      if (finishReason && finishReason !== 'STOP') {
+        log('⚠️', `Gemini finish=${finishReason} for batch [${repoNames.substring(0, 80)}]`);
+      }
+
+      const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      if (!raw) {
+        log('⚠️', `Gemini returned empty text for batch`);
+        throw new Error('Empty response');
+      }
+
+      // Log first 200 chars of raw response for debugging
+      log('  ', `Raw (${raw.length} chars): ${raw.substring(0, 200).replace(/\n/g, '\\n')}...`);
+
       const parsed = repairJSON(raw);
 
       if (!Array.isArray(parsed)) throw new Error(`Expected array, got ${typeof parsed}`);
       while (parsed.length < items.length) parsed.push(null);
 
+      log('  ', `✅ Batch parsed: ${parsed.filter(Boolean).length}/${items.length} valid`);
       return parsed.map((p, idx) => validateEnrichment(p, items[idx].type_hint));
 
     } catch (err) {
       if (attempt === retries) {
-        log('⚠️', `Batch parse failed — falling back to individual calls`);
+        log('⚠️', `Batch of ${items.length} failed after ${retries + 1} attempts — falling back to 1-by-1`);
         const results = [];
         for (const item of items) {
-          results.push(await enrichOneWithGemini(item));
-          await sleep(500);
+          const result = await enrichOneWithGemini(item);
+          results.push(result);
+          if (result) log('  ', `✅ ${item.full_name} enriched individually`);
+          await sleep(1000);
         }
+        log('  ', `1-by-1 fallback: ${results.filter(Boolean).length}/${items.length} succeeded`);
         return results;
       }
-      log('  ', `Gemini retry ${attempt + 1}: ${err.message.substring(0, 100)}`);
-      await sleep(3000);
+      log('  ', `Gemini batch retry ${attempt + 1}: ${err.message.substring(0, 120)}`);
+      await sleep(4000);
     }
   }
   return items.map(() => null);
