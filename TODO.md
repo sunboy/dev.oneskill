@@ -1,5 +1,15 @@
 # OneSkill.dev — TODO
 
+## Scraper Pipeline (v4 Two-Phase)
+
+- [ ] Run `005_raw_repos_staging.sql` migration in Supabase (if not done)
+- [x] Run discover mode — repos saved to `raw_repos` staging table
+- [ ] Run `--enrich` mode via GitHub Actions to process pending repos through Gemini
+- [ ] Run `003_scraper_state.sql` migration in Supabase (if not done)
+- [ ] Run `004_vibe_score.sql` migration in Supabase (if not done)
+- [ ] Trigger first vibe score run via GitHub Actions → "Compute Vibe Scores" → Run workflow
+- [ ] Verify Vercel deployment shows real data after enrichment populates `artifacts` table
+
 ## Vibe Score Pipeline — Additional Signal Sources
 
 - [ ] **GitHub Discussions** — search discussions/issues mentioning artifacts via GraphQL API (free, PAT already available, 5k req/hr)
@@ -7,13 +17,12 @@
 - [ ] **Stack Overflow** — question/answer mentions via Stack Exchange API (free with API key)
 - [ ] **Reddit** — needs `REDDIT_CLIENT_ID` + `REDDIT_CLIENT_SECRET` in GitHub Actions secrets (free "script" app at reddit.com/prefs/apps). Pipeline skips Reddit gracefully if not set.
 
-## Scraper
+## Frontend (Completed)
 
-- [ ] Run `003_scraper_state.sql` migration in Supabase
-- [ ] Run `004_vibe_score.sql` migration in Supabase
-- [ ] Trigger first bulk scrape via GitHub Actions → "Scrape GitHub for Agent Artifacts" → Run workflow → select **bulk**
-- [ ] Trigger first vibe score run via GitHub Actions → "Compute Vibe Scores" → Run workflow
-- [ ] Verify Vercel deployment shows real data after bulk scrape populates DB
+- [x] VibeRing, SignalChips, MentionCard, VibePanel, DownloadPulse components
+- [x] Vibe score on detail page sidebar + SignalChips below description
+- [x] VibeRing + DownloadPulse + SignalChips on homepage featured cards
+- [x] "Vibe" sort option on explore page
 
 ## Differentiation Features (Future)
 
@@ -22,10 +31,3 @@
 - [ ] **Maintenance health score** — issue response time, PR merge velocity, contributor count, last commit recency (all from GitHub API)
 - [ ] **One-click install** — deep links into IDE extensions for instant artifact installation
 - [ ] **Community curation** — let users submit their own stacks/combos, upvote artifacts, leave reviews
-
-## Frontend
-
-- [ ] Display vibe score on artifact cards and detail pages
-- [ ] Add "Trending" sort option using vibe_score
-- [ ] Show mention sources (HN, Reddit, Dev.to icons) on artifact detail page
-- [ ] Sentiment badge (positive/neutral/negative) on artifact cards

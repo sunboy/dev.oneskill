@@ -244,44 +244,75 @@ const PLATFORM_DEFAULTS = {
 
 // ─────────────────────────── GitHub API ──────────────────────────────
 
-async function githubFetch(url, raw = false) {
+const GITHUB_MAX_RETRIES = 4;  // retries on rate limit (wait + retry, not give up)
+
+async function githubFetch(url, raw = false, retries = GITHUB_MAX_RETRIES) {
   const headers = {
     Accept: raw ? 'application/vnd.github.v3.raw' : 'application/vnd.github.v3+json',
     'User-Agent': 'OneSkill-Scraper/4.0',
   };
   if (ENV.GITHUB_PAT) headers.Authorization = `token ${ENV.GITHUB_PAT}`;
 
-  const res = await fetch(url, { headers });
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(url, { headers });
 
-  const remaining = res.headers.get('x-ratelimit-remaining');
-  if (remaining !== null && parseInt(remaining, 10) < 3) {
-    const reset = parseInt(res.headers.get('x-ratelimit-reset') || '0', 10) * 1000;
-    const wait  = Math.max(0, reset - Date.now()) + 1500;
-    log('⏳', `Rate limit low (${remaining} left) — sleeping ${(wait / 1000).toFixed(0)}s`);
-    await sleep(wait);
-  }
+    // Proactive: sleep before we actually run out of requests
+    const remaining = res.headers.get('x-ratelimit-remaining');
+    if (remaining !== null && parseInt(remaining, 10) < 3) {
+      const reset = parseInt(res.headers.get('x-ratelimit-reset') || '0', 10) * 1000;
+      const wait  = Math.max(0, reset - Date.now()) + 2000;
+      log('⏳', `Rate limit low (${remaining} left) — sleeping ${(wait / 1000).toFixed(0)}s`);
+      await sleep(wait);
+    }
 
-  if (res.status === 403 || res.status === 429) {
-    log('🛑', `Rate limited (${res.status}) — waiting for reset`);
-    const reset = parseInt(res.headers.get('x-ratelimit-reset') || '0', 10) * 1000;
-    const wait  = Math.max(5000, reset - Date.now()) + 1500;
-    await sleep(Math.min(wait, 65000));
-    return null;
+    if (res.status === 403 || res.status === 429) {
+      const reset = parseInt(res.headers.get('x-ratelimit-reset') || '0', 10) * 1000;
+      const wait  = Math.max(5000, reset - Date.now()) + 2000;
+      const cappedWait = Math.min(wait, 120000);  // max 2 min wait
+      if (attempt < retries) {
+        log('⏳', `Rate limited (${res.status}) — retry ${attempt + 1}/${retries} in ${(cappedWait / 1000).toFixed(0)}s`);
+        await sleep(cappedWait);
+        continue;  // RETRY instead of returning null
+      }
+      log('🛑', `Rate limited (${res.status}) — exhausted ${retries} retries, skipping`);
+      return null;
+    }
+
+    if (res.status === 422) return null;  // bad query, don't retry
+    if (!res.ok) {
+      if (attempt < retries) {
+        log('⚠️', `GitHub ${res.status} — retry ${attempt + 1}/${retries}`);
+        await sleep(3000 * (attempt + 1));
+        continue;
+      }
+      return null;
+    }
+    return raw ? res.text() : res.json();
   }
-  if (res.status === 422) return null;
-  if (!res.ok) return null;
-  return raw ? res.text() : res.json();
+  return null;
 }
 
 async function searchRepos(query, sort = 'stars', pages = 1) {
   const repos = [];
+  let consecutiveEmpty = 0;
+
   for (let page = 1; page <= pages; page++) {
     const url =
       `https://api.github.com/search/repositories` +
       `?q=${encodeURIComponent(query)}&sort=${sort}&order=desc&per_page=30&page=${page}`;
 
     const data = await githubFetch(url);
-    if (!data || !data.items) break;
+    if (!data || !data.items) {
+      consecutiveEmpty++;
+      if (consecutiveEmpty >= 2) {
+        log('⚠️', `  [page ${page}] 2 consecutive empty responses — moving on`);
+        break;
+      }
+      log('⚠️', `  [page ${page}] empty response — trying next page`);
+      await sleep(3000);
+      continue;  // try next page instead of giving up
+    }
+    consecutiveEmpty = 0;
     repos.push(...data.items);
     if (data.items.length < 30) break;
     if (page >= 34) break;
@@ -333,13 +364,14 @@ function repoToRawRow(repo, hint, readme) {
  * No Gemini involved — purely GitHub → Supabase.
  */
 async function runDiscover(queries, cap = 0) {
-  log('🔎', `\n═══ PHASE 1: DISCOVER ═══\n`);
+  log('🔎', `\n═══ PHASE 1: DISCOVER (${queries.length} queries${cap ? `, cap: ${cap}` : ', no cap'}) ═══\n`);
 
   const seen = new Set();
   const repoBuffer = [];    // { repo, hint } — repos waiting for README fetch
   let totalSaved = 0;
 
-  for (const queryDef of queries) {
+  for (let qi = 0; qi < queries.length; qi++) {
+    const queryDef = queries[qi];
     if (cap && seen.size >= cap) {
       log('📦', `Hit ${cap} cap — stopping search`);
       break;
@@ -347,6 +379,8 @@ async function runDiscover(queries, cap = 0) {
 
     const { hint, q, sort, pages, bucketed } = queryDef;
     const buckets = bucketed ? STAR_BUCKETS : [''];
+
+    log('📋', `\n── Query ${qi + 1}/${queries.length} [${hint}] (${bucketed ? buckets.length + ' buckets' : 'no buckets'}, ${pages}p) ──`);
 
     for (const bucket of buckets) {
       if (cap && seen.size >= cap) break;
@@ -367,7 +401,7 @@ async function runDiscover(queries, cap = 0) {
           added++;
         }
       }
-      log('  ', `→ ${repos.length} results, ${added} new (${seen.size} total)`);
+      log('  ', `→ ${repos.length} results, ${added} new (${seen.size} total unique, ${repoBuffer.length} buffered)`);
       await sleep(2500);
 
       if (repos.length < 30) continue;
@@ -377,6 +411,7 @@ async function runDiscover(queries, cap = 0) {
     while (repoBuffer.length >= 50) {
       const batch = repoBuffer.splice(0, 50);
       totalSaved += await fetchReadmesAndSave(batch);
+      log('💾', `Saved batch — ${totalSaved} total saved, ${seen.size} unique discovered`);
     }
   }
 
