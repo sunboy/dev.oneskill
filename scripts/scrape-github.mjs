@@ -46,10 +46,10 @@ const ENRICH_LIMIT = ENRICH_LIMIT_ARG !== -1
 // ─────────────────────────── Configuration ───────────────────────────
 
 const BATCH_SIZE     = 20;    // Supabase upsert batch
-const GEMINI_BATCH   = 5;     // repos per Gemini call (lower = more reliable JSON)
 const GEMINI_MODEL   = 'gemini-2.5-flash';
 const GEMINI_URL     = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 const MAX_ENRICH_ATTEMPTS = 3;  // after this many failures, mark as 'skipped'
+const ENRICH_CONCURRENCY = 5;   // parallel Gemini calls
 
 // Incremental: cap per run to stay within GitHub Actions timeout
 const INCREMENTAL_CAP = 500;
@@ -482,48 +482,24 @@ const GEMINI_PLATFORMS  = [
   'Toolhouse', 'Browserbase', 'Steel', 'Firecrawl', 'Apify', 'Julep', 'Letta',
 ];
 
-function repairJSON(raw) {
-  let s = raw;
-  s = s.replace(/^```(?:json)?\s*/gm, '').replace(/```\s*$/gm, '');
-  s = s.replace(/,\s*([\]}])/g, '$1');
-  try { return JSON.parse(s); } catch (_) { /* continue */ }
-
-  const m = s.match(/\[[\s\S]*\]/);
-  if (m) { try { return JSON.parse(m[0]); } catch (_) { /* continue */ } }
-
-  // Fix unescaped control chars inside JSON strings
-  let fixed = '';
-  let inString = false;
-  let escaped = false;
-  const src = m ? m[0] : s;
-  for (let i = 0; i < src.length; i++) {
-    const ch = src[i];
-    if (escaped) { fixed += ch; escaped = false; continue; }
-    if (ch === '\\' && inString) { fixed += ch; escaped = true; continue; }
-    if (ch === '"') { inString = !inString; fixed += ch; continue; }
-    if (inString) {
-      if (ch === '\n') { fixed += '\\n'; continue; }
-      if (ch === '\r') { fixed += '\\r'; continue; }
-      if (ch === '\t') { fixed += '\\t'; continue; }
-      if (ch.charCodeAt(0) < 32) continue;
-    }
-    fixed += ch;
-  }
-  fixed = fixed.replace(/,\s*([\]}])/g, '$1');
-  try { return JSON.parse(fixed); } catch (_) { /* continue */ }
-
-  // Nuclear option
-  let nuclear = src.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
-  nuclear = nuclear.replace(/"([^"]*?)"/g, (match) => {
-    return match.replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
-  });
-  nuclear = nuclear.replace(/,\s*([\]}])/g, '$1');
-  try { return JSON.parse(nuclear); } catch (_) { /* continue */ }
-
-  throw new Error('JSON repair failed');
-}
-
 const VALID_TYPES = ['skill', 'mcp-server', 'cursor-rules', 'n8n-node', 'workflow', 'langchain-tool', 'crewai-tool'];
+
+// Gemini Structured Output schema — forces valid JSON, no parsing needed
+const GEMINI_RESPONSE_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    artifact_type:        { type: 'STRING', enum: VALID_TYPES },
+    long_description:     { type: 'STRING' },
+    category:             { type: 'STRING', enum: GEMINI_CATEGORIES },
+    tags:                 { type: 'ARRAY', items: { type: 'STRING' } },
+    compatible_platforms: { type: 'ARRAY', items: { type: 'STRING', enum: GEMINI_PLATFORMS } },
+    install_command:      { type: 'STRING' },
+    npm_package_name:     { type: 'STRING', nullable: true },
+    meta_title:           { type: 'STRING' },
+    meta_description:     { type: 'STRING' },
+  },
+  required: ['artifact_type', 'long_description', 'category', 'tags', 'compatible_platforms', 'install_command', 'meta_title', 'meta_description'],
+};
 
 function validateEnrichment(p, hint) {
   if (!p || typeof p !== 'object') return null;
@@ -532,103 +508,39 @@ function validateEnrichment(p, hint) {
   if (Array.isArray(p.compatible_platforms)) {
     p.compatible_platforms = p.compatible_platforms.filter(pl => GEMINI_PLATFORMS.includes(pl));
   }
+  if (Array.isArray(p.tags)) p.tags = p.tags.slice(0, 7);
   return p;
 }
 
-function buildGeminiPrompt(items) {
-  const repoSummaries = items.map((item, idx) => {
-    const excerpt = item.readme ? item.readme.substring(0, 1800) : 'No README.';
-    return `### REPO_${idx}
-- full_name: ${item.full_name}
-- description: ${item.description || '(none)'}
-- language: ${item.language || 'Unknown'}
-- stars: ${item.stars} | forks: ${item.forks}
-- topics: ${item.topics_str || '(none)'}
-- updated: ${item.github_updated_at}
-README excerpt:
-${excerpt}`;
-  }).join('\n\n');
+function buildSingleRepoPrompt(item) {
+  const excerpt = item.readme ? item.readme.substring(0, 2500) : 'No README.';
+  return `Classify this GitHub repository as an "agent artifact" for OneSkill.dev.
 
-  return `You are classifying ${items.length} GitHub repositories as "agent artifacts" for OneSkill.dev. Return ONLY a valid JSON array of ${items.length} objects — one per repo, same order. No markdown fences, no extra text.
+Repository: ${item.full_name}
+Description: ${item.description || '(none)'}
+Language: ${item.language || 'Unknown'}
+Stars: ${item.stars} | Forks: ${item.forks}
+Topics: ${item.topics_str || '(none)'}
+Updated: ${item.github_updated_at}
 
-${repoSummaries}
+README:
+${excerpt}
 
-## Classification rules
-artifact_type must be EXACTLY one of: skill, mcp-server, cursor-rules, n8n-node, workflow, langchain-tool, crewai-tool
-category must be EXACTLY one of: ${GEMINI_CATEGORIES.join(', ')}
-compatible_platforms must be a subset of: ${GEMINI_PLATFORMS.join(', ')}
-tags: 3–7 lowercase hyphenated keywords (e.g. "web-scraping", "auth", "react")
-
-Heuristics:
-- MCP server → "mcp-server"  |  Cursor rules → "cursor-rules"  |  Skill (SKILL.md) → "skill"
-- n8n community node → "n8n-node"  |  Workflow/orchestration → "workflow"
-- LangChain tool → "langchain-tool"  |  CrewAI tool → "crewai-tool"
-
-Install patterns: MCP/npm: "npx -y <pkg>" | Skills: "npx skills add <owner>/<repo>" | pip: "pip install <pkg>" | Cursor: "curl -o .cursorrules <url>" | n8n: "npm install <pkg>"
-
-Each object shape:
-{"artifact_type":"...","long_description":"2-3 sentences.","category":"...","tags":[...],"compatible_platforms":[...],"install_command":"...","npm_package_name":null,"meta_title":"under 60 chars","meta_description":"under 160 chars"}`;
+Rules:
+- artifact_type: MCP server → "mcp-server" | Cursor rules → "cursor-rules" | Skill/SKILL.md → "skill" | n8n node → "n8n-node" | Workflow → "workflow" | LangChain tool → "langchain-tool" | CrewAI tool → "crewai-tool"
+- long_description: 2-3 sentence summary of what this tool does
+- tags: 3-7 lowercase hyphenated keywords
+- install_command: npm → "npx -y <pkg>" | skills → "npx skills add owner/repo" | pip → "pip install <pkg>" | n8n → "npm install <pkg>"
+- meta_title: under 60 chars
+- meta_description: under 160 chars`;
 }
 
 /**
- * Enrich a single raw_repo row via Gemini. Returns enrichment result or null.
+ * Enrich a single raw_repo row via Gemini with structured output.
+ * Uses responseSchema so Gemini MUST return valid JSON — no parsing needed.
  */
 async function enrichOneWithGemini(item, retries = 3) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      // On last attempt, drop responseMimeType to let Gemini respond freely
-      const isLastAttempt = attempt === retries;
-      const genConfig = isLastAttempt
-        ? { temperature: 0.05, maxOutputTokens: 800 }
-        : { temperature: 0.1, maxOutputTokens: 800, responseMimeType: 'application/json' };
-
-      const res = await fetch(`${GEMINI_URL}?key=${ENV.GEMINI_API_KEY}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: buildGeminiPrompt([item]) }] }],
-          generationConfig: genConfig,
-        }),
-      });
-      if (res.status === 429) { await sleep(Math.pow(2, attempt + 1) * 5000); continue; }
-      if (!res.ok) {
-        const errText = await res.text();
-        log('  ', `Gemini ${res.status} for ${item.full_name}: ${errText.substring(0, 150)}`);
-        throw new Error(`${res.status}`);
-      }
-      const data = await res.json();
-
-      // Check for blocked/empty responses
-      const finishReason = data.candidates?.[0]?.finishReason;
-      if (finishReason && finishReason !== 'STOP') {
-        log('  ', `Gemini finish=${finishReason} for ${item.full_name}`);
-      }
-
-      const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      if (!raw) {
-        log('  ', `Gemini returned empty text for ${item.full_name}`);
-        throw new Error('Empty response');
-      }
-
-      const parsed = repairJSON(raw);
-      const arr = Array.isArray(parsed) ? parsed : [parsed];
-      return validateEnrichment(arr[0], item.type_hint);
-    } catch (err) {
-      log('  ', `[1x1] attempt ${attempt + 1}/${retries + 1} for ${item.full_name}: ${err.message.substring(0, 80)}`);
-      if (attempt === retries) return null;
-      await sleep(3000);
-    }
-  }
-  return null;
-}
-
-/**
- * Enrich a batch of raw_repos via a SINGLE Gemini call.
- * Falls back to individual calls if batch parsing fails.
- */
-async function enrichBatchWithGemini(items, retries = 2) {
-  const prompt = buildGeminiPrompt(items);
-  const repoNames = items.map(i => i.full_name).join(', ');
+  const prompt = buildSingleRepoPrompt(item);
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
@@ -637,64 +549,76 @@ async function enrichBatchWithGemini(items, retries = 2) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.1, maxOutputTokens: items.length * 500, responseMimeType: 'application/json' },
+          generationConfig: {
+            temperature: 0.1,
+            maxOutputTokens: 1024,
+            responseMimeType: 'application/json',
+            responseSchema: GEMINI_RESPONSE_SCHEMA,
+          },
         }),
       });
 
       if (res.status === 429) {
         const wait = Math.pow(2, attempt + 1) * 5000;
-        log('⏳', `Gemini 429 — backing off ${(wait / 1000).toFixed(0)}s`);
+        log('⏳', `Gemini 429 for ${item.full_name} — retry in ${(wait / 1000).toFixed(0)}s`);
         await sleep(wait);
         continue;
       }
       if (!res.ok) {
         const errText = await res.text();
-        throw new Error(`HTTP ${res.status}: ${errText.substring(0, 200)}`);
+        log('  ', `Gemini ${res.status} for ${item.full_name}: ${errText.substring(0, 200)}`);
+        throw new Error(`HTTP ${res.status}`);
       }
 
       const data = await res.json();
-
-      // Check for blocked/filtered responses
       const finishReason = data.candidates?.[0]?.finishReason;
       if (finishReason && finishReason !== 'STOP') {
-        log('⚠️', `Gemini finish=${finishReason} for batch [${repoNames.substring(0, 80)}]`);
+        log('  ', `Gemini finish=${finishReason} for ${item.full_name}`);
+        if (finishReason === 'SAFETY' || finishReason === 'RECITATION') {
+          return null;  // can't process this repo
+        }
       }
 
       const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      if (!raw) {
-        log('⚠️', `Gemini returned empty text for batch`);
-        throw new Error('Empty response');
-      }
+      if (!raw) throw new Error('Empty response');
 
-      // Log first 200 chars of raw response for debugging
-      log('  ', `Raw (${raw.length} chars): ${raw.substring(0, 200).replace(/\n/g, '\\n')}...`);
-
-      const parsed = repairJSON(raw);
-
-      if (!Array.isArray(parsed)) throw new Error(`Expected array, got ${typeof parsed}`);
-      while (parsed.length < items.length) parsed.push(null);
-
-      log('  ', `✅ Batch parsed: ${parsed.filter(Boolean).length}/${items.length} valid`);
-      return parsed.map((p, idx) => validateEnrichment(p, items[idx].type_hint));
-
+      // With responseSchema, Gemini returns valid JSON — just parse it
+      const parsed = JSON.parse(raw);
+      return validateEnrichment(parsed, item.type_hint);
     } catch (err) {
-      if (attempt === retries) {
-        log('⚠️', `Batch of ${items.length} failed after ${retries + 1} attempts — falling back to 1-by-1`);
-        const results = [];
-        for (const item of items) {
-          const result = await enrichOneWithGemini(item);
-          results.push(result);
-          if (result) log('  ', `✅ ${item.full_name} enriched individually`);
-          await sleep(1000);
-        }
-        log('  ', `1-by-1 fallback: ${results.filter(Boolean).length}/${items.length} succeeded`);
-        return results;
+      if (attempt < retries) {
+        log('  ', `  retry ${attempt + 1}/${retries} for ${item.full_name}: ${err.message.substring(0, 80)}`);
+        await sleep(2000 * (attempt + 1));
+      } else {
+        log('❌', `  FAILED ${item.full_name} after ${retries + 1} attempts: ${err.message.substring(0, 80)}`);
+        return null;
       }
-      log('  ', `Gemini batch retry ${attempt + 1}: ${err.message.substring(0, 120)}`);
-      await sleep(4000);
     }
   }
-  return items.map(() => null);
+  return null;
+}
+
+/**
+ * Enrich items with concurrency control.
+ * Processes ENRICH_CONCURRENCY repos in parallel for speed.
+ */
+async function enrichBatchConcurrent(items) {
+  const results = new Array(items.length).fill(null);
+  let nextIdx = 0;
+
+  async function worker() {
+    while (nextIdx < items.length) {
+      const idx = nextIdx++;
+      results[idx] = await enrichOneWithGemini(items[idx]);
+      if (results[idx]) {
+        log('  ', `✅ ${items[idx].full_name}`);
+      }
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(ENRICH_CONCURRENCY, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
 }
 
 // ─── Contributors ────────────────────────────────────────────────────
@@ -888,11 +812,13 @@ async function runEnrich(limit = ENRICH_LIMIT) {
   let failed = 0;
 
   // Process in Gemini-batch-sized chunks
-  for (let start = 0; start < pending.length; start += GEMINI_BATCH) {
-    const chunk = pending.slice(start, start + GEMINI_BATCH);
+  // Process in waves of 20 repos at a time (ENRICH_CONCURRENCY parallel Gemini calls)
+  const WAVE_SIZE = 20;
+  for (let start = 0; start < pending.length; start += WAVE_SIZE) {
+    const wave = pending.slice(start, start + WAVE_SIZE);
 
     // Prepare items for Gemini prompt
-    const geminiItems = chunk.map(row => ({
+    const geminiItems = wave.map(row => ({
       full_name:        row.github_full_name,
       description:      row.description,
       language:         row.language,
@@ -904,14 +830,14 @@ async function runEnrich(limit = ENRICH_LIMIT) {
       type_hint:        row.type_hint,
     }));
 
-    log('🤖', `Enriching batch ${Math.floor(start / GEMINI_BATCH) + 1}/${Math.ceil(pending.length / GEMINI_BATCH)} (${chunk.length} repos)`);
+    log('🤖', `Wave ${Math.floor(start / WAVE_SIZE) + 1}/${Math.ceil(pending.length / WAVE_SIZE)} — ${wave.length} repos (${ENRICH_CONCURRENCY} parallel)`);
 
-    const enrichments = await enrichBatchWithGemini(geminiItems);
-    await sleep(800);
+    const enrichments = await enrichBatchConcurrent(geminiItems);
+    await sleep(500);
 
     const artifacts = [];
-    for (let j = 0; j < chunk.length; j++) {
-      const rawRepo = chunk[j];
+    for (let j = 0; j < wave.length; j++) {
+      const rawRepo = wave[j];
       const enrichment = enrichments[j];
 
       if (!enrichment) {
@@ -937,7 +863,7 @@ async function runEnrich(limit = ENRICH_LIMIT) {
         continue;
       }
 
-      // Increment attempt counter even on success (for tracking)
+      // Increment attempt counter even on success
       try {
         await sbPatch(
           'raw_repos',
@@ -958,6 +884,9 @@ async function runEnrich(limit = ENRICH_LIMIT) {
     if (artifacts.length > 0) {
       totalUpserted += await upsertArtifacts(artifacts);
     }
+
+    const pct = Math.round(((start + wave.length) / pending.length) * 100);
+    log('📊', `Progress: ${enriched} enriched, ${failed} failed (${pct}%)`);
   }
 
   log('🏁', `Enrich complete: ${enriched} enriched, ${failed} failed, ${totalUpserted} upserted to artifacts`);
