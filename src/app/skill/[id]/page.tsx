@@ -2,7 +2,9 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import Navigation from "@/components/Navigation";
 import Footer from "@/components/Footer";
-import { getArtifactById } from "@/lib/data";
+import VibePanel from "@/components/VibePanel";
+import SignalChips from "@/components/SignalChips";
+import { getArtifactById, getMentionsForArtifact } from "@/lib/data";
 import { artifactTypeLabels, formatNumber, getTimeAgo } from "@/lib/types";
 import CopyButton from "./CopyButton";
 
@@ -16,6 +18,9 @@ export default async function SkillDetail({ params }: { params: Promise<{ id: st
     artifact = await getArtifactBySlug(id);
   }
   if (!artifact) notFound();
+
+  // Fetch social mentions for vibe panel
+  const mentions = await getMentionsForArtifact(artifact.id);
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -51,9 +56,12 @@ export default async function SkillDetail({ params }: { params: Promise<{ id: st
               </span>
             </div>
 
-            <p className="text-[1.0625rem] text-muted-foreground leading-relaxed max-w-[60ch] mb-8">
+            <p className="text-[1.0625rem] text-muted-foreground leading-relaxed max-w-[60ch] mb-4">
               {artifact.long_description}
             </p>
+            <div className="mb-8">
+              <SignalChips artifact={artifact} />
+            </div>
 
             {/* Install commands */}
             <div className="mb-10">
@@ -101,6 +109,11 @@ export default async function SkillDetail({ params }: { params: Promise<{ id: st
           {/* Sidebar */}
           <aside className="lg:col-span-4">
             <div className="lg:sticky lg:top-[80px]">
+              {/* Vibe Panel */}
+              <div className="mb-8">
+                <VibePanel artifact={artifact} mentions={mentions} />
+              </div>
+
               <div className="mb-8">
                 <span className="text-[0.625rem] tracking-[0.08em] uppercase text-muted-foreground block mb-2" style={{ fontFamily: "var(--font-mono)" }}>Author</span>
                 <span className="text-[0.9375rem] font-semibold tracking-[-0.01em]" style={{ fontFamily: "var(--font-display)" }}>

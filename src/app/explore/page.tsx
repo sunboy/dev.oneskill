@@ -9,7 +9,7 @@ import { artifactTypeSlugs, artifactTypeLabels, type ArtifactTypeSlug, type Cate
 import type { Artifact } from "@/lib/types";
 import { supabase } from "@/lib/supabase";
 
-type SortOption = "stars" | "updated" | "downloads" | "trending" | "name";
+type SortOption = "stars" | "updated" | "downloads" | "trending" | "vibe" | "name";
 
 export default function Explore() {
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
@@ -90,6 +90,7 @@ export default function Explore() {
       case "updated": result = [...result].sort((a, b) => new Date(b.github_updated_at).getTime() - new Date(a.github_updated_at).getTime()); break;
       case "downloads": result = [...result].sort((a, b) => b.weekly_downloads - a.weekly_downloads); break;
       case "trending": result = [...result].sort((a, b) => b.trending_score - a.trending_score); break;
+      case "vibe": result = [...result].sort((a, b) => (b.vibe_score || 0) - (a.vibe_score || 0)); break;
       case "name": result = [...result].sort((a, b) => a.name.localeCompare(b.name)); break;
     }
     return result;
@@ -222,6 +223,7 @@ export default function Explore() {
               <div className="flex items-baseline gap-1">
                 {([
                   { key: "trending", label: "Trending" },
+                  { key: "vibe", label: "Vibe" },
                   { key: "stars", label: "Stars" },
                   { key: "updated", label: "Updated" },
                   { key: "downloads", label: "Downloads" },

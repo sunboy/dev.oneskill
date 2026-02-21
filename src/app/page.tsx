@@ -2,6 +2,9 @@ import Link from "next/link";
 import Navigation from "@/components/Navigation";
 import Footer from "@/components/Footer";
 import SkillRow from "@/components/SkillRow";
+import VibeRing from "@/components/VibeRing";
+import DownloadPulse from "@/components/DownloadPulse";
+import SignalChips from "@/components/SignalChips";
 import { getFeaturedArtifacts, getRecentArtifacts, getArtifacts } from "@/lib/data";
 import { artifactTypeLabels, formatNumber } from "@/lib/types";
 import type { Artifact } from "@/lib/types";
@@ -143,48 +146,56 @@ export default async function Home() {
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2">
-          {featured.map((artifact: Artifact, i: number) => (
-            <Link key={artifact.id} href={`/skill/${artifact.slug}`}>
-              <div
-                className={`group py-8 px-6 transition-colors duration-150 hover:bg-[oklch(0.96_0.005_80)] cursor-pointer border-border ${
-                  i % 2 !== 0 ? "md:border-l" : ""
-                } ${i >= 2 ? "border-t" : "border-b md:border-b-0"}`}
-              >
-                <div className="flex items-baseline gap-3 mb-2">
-                  <span
-                    className="text-[0.625rem] tracking-[0.06em] uppercase text-muted-foreground border border-border px-1.5 py-0.5"
-                    style={{ fontFamily: "var(--font-mono)" }}
-                  >
-                    {artifact.artifact_type?.label || "Skill"}
-                  </span>
-                  <span className="text-[0.625rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>
-                    {formatNumber(artifact.stars)} stars
-                  </span>
-                  <span className="text-[0.625rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>
-                    {formatNumber(artifact.weekly_downloads)} installs/wk
-                  </span>
-                </div>
-                <h3
-                  className="text-[1.25rem] font-semibold tracking-[-0.02em] mb-2 group-hover:text-[var(--color-vermillion)] transition-colors duration-150"
-                  style={{ fontFamily: "var(--font-display)" }}
+          {featured.map((artifact: Artifact, i: number) => {
+            const hasVibe = artifact.vibe_score > 0 || artifact.npm_downloads_weekly > 0 || artifact.pypi_downloads_weekly > 0;
+            const totalDownloads = (artifact.npm_downloads_weekly || 0) + (artifact.pypi_downloads_weekly || 0);
+            return (
+              <Link key={artifact.id} href={`/skill/${artifact.slug}`}>
+                <div
+                  className={`group py-8 px-6 transition-colors duration-150 hover:bg-[oklch(0.96_0.005_80)] cursor-pointer border-border ${
+                    i % 2 !== 0 ? "md:border-l" : ""
+                  } ${i >= 2 ? "border-t" : "border-b md:border-b-0"}`}
                 >
-                  {artifact.name}
-                </h3>
-                <p className="text-[0.8125rem] text-muted-foreground leading-relaxed line-clamp-2 mb-4">
-                  {artifact.description}
-                </p>
-                <div className="flex items-baseline gap-2">
-                  <span className="text-[0.625rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>
-                    @{artifact.contributor?.github_username || "Unknown"}
-                  </span>
-                  <span className="text-[0.625rem] text-muted-foreground">·</span>
-                  <span className="text-[0.625rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>
-                    {artifact.artifact_platforms?.length || 0} platforms
-                  </span>
+                  <div className="flex items-start gap-4 mb-3">
+                    {hasVibe && <VibeRing score={artifact.vibe_score} size="sm" />}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-baseline gap-3 mb-1">
+                        <span
+                          className="text-[0.625rem] tracking-[0.06em] uppercase text-muted-foreground border border-border px-1.5 py-0.5"
+                          style={{ fontFamily: "var(--font-mono)" }}
+                        >
+                          {artifact.artifact_type?.label || "Skill"}
+                        </span>
+                        <span className="text-[0.625rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>
+                          {formatNumber(artifact.stars)} stars
+                        </span>
+                      </div>
+                    </div>
+                    {totalDownloads > 0 && <DownloadPulse downloads={totalDownloads} />}
+                  </div>
+                  <h3
+                    className="text-[1.25rem] font-semibold tracking-[-0.02em] mb-2 group-hover:text-[var(--color-vermillion)] transition-colors duration-150"
+                    style={{ fontFamily: "var(--font-display)" }}
+                  >
+                    {artifact.name}
+                  </h3>
+                  <p className="text-[0.8125rem] text-muted-foreground leading-relaxed line-clamp-2 mb-3">
+                    {artifact.description}
+                  </p>
+                  <SignalChips artifact={artifact} compact />
+                  <div className="flex items-baseline gap-2 mt-3">
+                    <span className="text-[0.625rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>
+                      @{artifact.contributor?.github_username || "Unknown"}
+                    </span>
+                    <span className="text-[0.625rem] text-muted-foreground">·</span>
+                    <span className="text-[0.625rem] text-muted-foreground" style={{ fontFamily: "var(--font-mono)" }}>
+                      {artifact.artifact_platforms?.length || 0} platforms
+                    </span>
+                  </div>
                 </div>
-              </div>
-            </Link>
-          ))}
+              </Link>
+            );
+          })}
         </div>
       </section>
 

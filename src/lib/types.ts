@@ -104,6 +104,68 @@ export interface Artifact {
   artifact_platforms?: { platform: Platform }[];
 }
 
+// ─── Mention type (from artifact_mentions table) ─────────────────────
+
+export type MentionSource = "hackernews" | "reddit" | "devto" | "hashnode" | "stackoverflow" | "github_discussions";
+
+export interface ArtifactMention {
+  id: string;
+  artifact_id: string;
+  source: MentionSource;
+  external_id: string;
+  title: string;
+  url: string;
+  author: string;
+  score: number;
+  comment_count: number;
+  sentiment: number | null;
+  snippet: string;
+  mentioned_at: string;
+  created_at: string;
+}
+
+// ─── Feature flags for vibe score sources ────────────────────────────
+
+export const VIBE_FLAGS = {
+  npm: true,
+  pypi: true,
+  hackernews: true,
+  reddit: true,
+  devto: true,
+  sentiment: true,
+} as const;
+
+// ─── Vibe score helpers ──────────────────────────────────────────────
+
+export function vibeColor(score: number): string {
+  if (score >= 70) return "oklch(0.58 0.22 25)";       // hot — vermillion
+  if (score >= 40) return "oklch(0.65 0.18 55)";       // warm — amber
+  if (score >= 20) return "oklch(0.55 0.01 60)";       // neutral — gray
+  return "oklch(0.65 0.12 250)";                       // cold — blue
+}
+
+export function vibeLabel(score: number): string {
+  if (score >= 70) return "Buzzing";
+  if (score >= 40) return "Active";
+  if (score >= 20) return "Quiet";
+  return "New";
+}
+
+export function sentimentLabel(avg: number): "positive" | "neutral" | "negative" {
+  if (avg > 0.2) return "positive";
+  if (avg < -0.2) return "negative";
+  return "neutral";
+}
+
+export const MENTION_SOURCE_META: Record<MentionSource, { label: string; shortLabel: string; color: string }> = {
+  hackernews:          { label: "Hacker News",        shortLabel: "HN",  color: "#ff6600" },
+  reddit:              { label: "Reddit",             shortLabel: "r/",  color: "#ff4500" },
+  devto:               { label: "Dev.to",             shortLabel: "d",   color: "#0a0a0a" },
+  hashnode:            { label: "Hashnode",           shortLabel: "h",   color: "#2962ff" },
+  stackoverflow:       { label: "Stack Overflow",     shortLabel: "SO",  color: "#f48024" },
+  github_discussions:  { label: "GitHub Discussions",  shortLabel: "GH",  color: "#24292e" },
+};
+
 // ─── UI constants ───────────────────────────────────────────────────
 
 export const artifactTypeLabels: Record<ArtifactTypeSlug, string> = {

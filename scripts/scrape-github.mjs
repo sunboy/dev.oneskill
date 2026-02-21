@@ -1,36 +1,58 @@
 #!/usr/bin/env node
 
 /**
- * OneSkill GitHub Artifact Scraper  v3
+ * OneSkill GitHub Artifact Scraper  v4
  *
- * Two modes:
- *   BULK  (--bulk)  : First-time full index. No repo cap, pages through
- *                     everything, stores cursor in Supabase for resume.
- *   INCREMENTAL     : Default. Picks up new/updated repos since last run.
- *                     Runs every 4h via GitHub Actions.
+ * Two-phase architecture — discover first, enrich later.
+ * Each phase is independent and retryable.
  *
- * Pipeline:  GitHub Search → README fetch → Gemini enrichment → Supabase upsert
+ * Modes:
+ *   --discover       : Phase 1. GitHub Search → fetch READMEs → save to raw_repos table.
+ *                      No Gemini needed. Safe to run repeatedly (upserts by full_name).
+ *
+ *   --enrich         : Phase 2. Pick unenriched rows from raw_repos → Gemini → upsert
+ *                      to artifacts table. Retryable — failed rows get retried next run.
+ *                      --enrich-limit N  : max repos to enrich per run (default: 200)
+ *
+ *   --bulk           : Combined discover+enrich for full index (backward compat).
+ *                      Runs discover first (all queries), then enriches everything.
+ *
+ *   (default)        : Incremental discover (recent repos) + enrich pending.
  *
  * Supabase tables:
- *   artifact_types, categories, platforms        – lookups
- *   contributors                                 – upsert by github_username
- *   artifacts                                    – main table (upsert on github_repo_full_name)
- *   artifact_platforms                           – junction table
- *   scraper_state                                – cursor/offset tracking per query
+ *   raw_repos              – staging table (Phase 1 output, Phase 2 input)
+ *   artifact_types, categories, platforms – lookups
+ *   contributors           – upsert by github_username
+ *   artifacts              – main table (Phase 2 output)
+ *   artifact_platforms     – junction table
+ *   scraper_state          – cursor/offset tracking per query
  */
+
+// ─────────────────────────── CLI flags ───────────────────────────
+
+const FLAGS = {
+  discover:     process.argv.includes('--discover'),
+  enrich:       process.argv.includes('--enrich'),
+  bulk:         process.argv.includes('--bulk'),
+};
+// If none specified, default to incremental (discover recent + enrich pending)
+const IS_INCREMENTAL = !FLAGS.discover && !FLAGS.enrich && !FLAGS.bulk;
+
+const ENRICH_LIMIT_ARG = process.argv.indexOf('--enrich-limit');
+const ENRICH_LIMIT = ENRICH_LIMIT_ARG !== -1
+  ? parseInt(process.argv[ENRICH_LIMIT_ARG + 1], 10) || 200
+  : 200;
 
 // ─────────────────────────── Configuration ───────────────────────────
 
-const MODE           = process.argv.includes('--bulk') ? 'bulk' : 'incremental';
 const BATCH_SIZE     = 20;    // Supabase upsert batch
 const GEMINI_BATCH   = 10;    // repos per Gemini call
 const GEMINI_MODEL   = 'gemini-2.5-flash';
 const GEMINI_URL     = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+const MAX_ENRICH_ATTEMPTS = 3;  // after this many failures, mark as 'skipped'
 
 // Incremental: cap per run to stay within GitHub Actions timeout
-const INCREMENTAL_CAP = 300;
-// Bulk: process this many per query before moving to next (avoid starving other types)
-const BULK_PER_QUERY  = 500;
+const INCREMENTAL_CAP = 500;
 
 // GitHub Search API returns max 1000 results per query.
 // We use star-range buckets to get past this limit.
@@ -41,12 +63,9 @@ const STAR_BUCKETS = [
 ];
 
 // ─────────────────────────── Search Queries ──────────────────────────
-// Each query can be "bucketed" by stars to get past the 1000-result GitHub limit.
-// pages: max pages to fetch per bucket (30 results/page, max ~33 pages = 1000)
-// bucketed: if true, we append each STAR_BUCKET to get full coverage
 
 const SEARCH_QUERIES = [
-  // ── MCP Servers (~8,600+) ─────────────────────────────────────────
+  // ── MCP Servers (~8,600+)
   { hint: 'mcp-server', q: '"mcp-server" in:name language:TypeScript', sort: 'stars', pages: 34, bucketed: true },
   { hint: 'mcp-server', q: '"mcp-server" in:name language:Python',     sort: 'stars', pages: 34, bucketed: true },
   { hint: 'mcp-server', q: '"mcp-server" in:name language:Go',         sort: 'stars', pages: 10, bucketed: false },
@@ -58,7 +77,7 @@ const SEARCH_QUERIES = [
   { hint: 'mcp-server', q: '"mcp" "server" in:name,description filename:mcp.json', sort: 'stars', pages: 10, bucketed: false },
   { hint: 'mcp-server', q: '"@modelcontextprotocol/sdk" in:readme',    sort: 'stars', pages: 10, bucketed: false },
 
-  // ── Cursor Rules (~800+) ──────────────────────────────────────────
+  // ── Cursor Rules (~800+)
   { hint: 'cursor-rules', q: 'topic:cursor-rules',                            sort: 'stars', pages: 34, bucketed: false },
   { hint: 'cursor-rules', q: 'topic:cursorrules',                             sort: 'stars', pages: 34, bucketed: false },
   { hint: 'cursor-rules', q: '"cursorrules" in:name,description',             sort: 'stars', pages: 20, bucketed: false },
@@ -67,7 +86,7 @@ const SEARCH_QUERIES = [
   { hint: 'cursor-rules', q: 'topic:cursor-skills',                           sort: 'stars', pages: 5,  bucketed: false },
   { hint: 'cursor-rules', q: 'filename:.cursorrules path:/',                  sort: 'stars', pages: 20, bucketed: false },
 
-  // ── Skills / Claude Code (~15,000+) ───────────────────────────────
+  // ── Skills / Claude Code (~15,000+)
   { hint: 'skill', q: 'topic:agent-skills',                                   sort: 'stars', pages: 34, bucketed: true },
   { hint: 'skill', q: 'topic:agent-skill',                                    sort: 'stars', pages: 20, bucketed: false },
   { hint: 'skill', q: 'topic:claude-skills',                                  sort: 'stars', pages: 20, bucketed: false },
@@ -81,7 +100,7 @@ const SEARCH_QUERIES = [
   { hint: 'skill', q: '"claude-code" "plugin" in:name,description',           sort: 'stars', pages: 10, bucketed: false },
   { hint: 'skill', q: '"agent-skills-cli" OR "openskills" in:readme',         sort: 'stars', pages: 5,  bucketed: false },
 
-  // ── n8n Nodes (~5,800+) ───────────────────────────────────────────
+  // ── n8n Nodes (~5,800+)
   { hint: 'n8n-node', q: '"n8n-nodes-" in:name',                              sort: 'stars', pages: 34, bucketed: true },
   { hint: 'n8n-node', q: 'topic:n8n-community-node-package',                  sort: 'stars', pages: 34, bucketed: true },
   { hint: 'n8n-node', q: 'topic:n8n-community-node',                          sort: 'stars', pages: 34, bucketed: false },
@@ -91,7 +110,7 @@ const SEARCH_QUERIES = [
   { hint: 'n8n-node', q: '"n8n-community-node-package" in:readme',            sort: 'stars', pages: 20, bucketed: false },
   { hint: 'n8n-node', q: '"n8n-nodes" in:name language:TypeScript',           sort: 'stars', pages: 20, bucketed: false },
 
-  // ── Workflows (~thousands) ────────────────────────────────────────
+  // ── Workflows (~thousands)
   { hint: 'workflow', q: 'topic:ai-workflow',                                  sort: 'stars', pages: 20, bucketed: false },
   { hint: 'workflow', q: 'topic:agent-workflow',                               sort: 'stars', pages: 20, bucketed: false },
   { hint: 'workflow', q: 'topic:agentic-workflow',                             sort: 'stars', pages: 20, bucketed: false },
@@ -101,7 +120,7 @@ const SEARCH_QUERIES = [
   { hint: 'workflow', q: '"ai workflow" in:name,description',                  sort: 'stars', pages: 10, bucketed: false },
   { hint: 'workflow', q: 'topic:autogen',                                      sort: 'stars', pages: 10, bucketed: false },
 
-  // ── LangChain Tools (~1,000+) ─────────────────────────────────────
+  // ── LangChain Tools (~1,000+)
   { hint: 'langchain-tool', q: 'topic:langchain-tool',                        sort: 'stars', pages: 20, bucketed: false },
   { hint: 'langchain-tool', q: 'topic:langchain-tools',                       sort: 'stars', pages: 20, bucketed: false },
   { hint: 'langchain-tool', q: '"langchain" "tool" in:name,description',      sort: 'stars', pages: 34, bucketed: true },
@@ -109,7 +128,7 @@ const SEARCH_QUERIES = [
   { hint: 'langchain-tool', q: 'topic:langchain language:python',             sort: 'stars', pages: 20, bucketed: false },
   { hint: 'langchain-tool', q: '"langchain" "integration" in:name,description', sort: 'stars', pages: 10, bucketed: false },
 
-  // ── CrewAI Tools (~500+) ──────────────────────────────────────────
+  // ── CrewAI Tools (~500+)
   { hint: 'crewai-tool', q: 'topic:crewai',                                   sort: 'stars', pages: 34, bucketed: true },
   { hint: 'crewai-tool', q: 'topic:crewai-tools',                             sort: 'stars', pages: 20, bucketed: false },
   { hint: 'crewai-tool', q: '"crewai" "tool" in:name,description',            sort: 'stars', pages: 20, bucketed: false },
@@ -132,11 +151,14 @@ const ENV = {
 };
 
 function validateEnv() {
-  const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'GEMINI_API_KEY'];
-  const missing  = required.filter((k) => !ENV[k]);
+  const mode = FLAGS.discover ? 'discover' : FLAGS.enrich ? 'enrich' : FLAGS.bulk ? 'bulk' : 'incremental';
+  const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'];
+  // Gemini only needed for enrich/bulk/incremental
+  if (!FLAGS.discover) required.push('GEMINI_API_KEY');
+  const missing = required.filter((k) => !ENV[k]);
   if (missing.length) { console.error(`Missing env vars: ${missing.join(', ')}`); process.exit(1); }
   if (!ENV.GITHUB_PAT) log('⚠️', 'No GITHUB_PAT — search rate limit will be 10 req/min');
-  log('✅', `Environment OK — mode: ${MODE}`);
+  log('✅', `Environment OK — mode: ${mode}`);
 }
 
 // ─────────────────────────── Supabase helpers ────────────────────────
@@ -166,32 +188,17 @@ async function sbUpsert(table, rows, onConflict) {
   return res.json();
 }
 
-// ─────────────────────────── Scraper state (cursor tracking) ────────
-// Stores per-query offset so bulk runs can resume across invocations.
-
-async function loadScraperState() {
-  try {
-    const rows = await sbGet('scraper_state', 'select=query_key,last_page,last_bucket_idx,updated_at');
-    const state = {};
-    for (const r of rows) state[r.query_key] = r;
-    return state;
-  } catch {
-    // Table might not exist yet — that's OK for first run
-    return {};
+async function sbPatch(table, query, patch) {
+  const headers = { ...sbHeaders(), Prefer: 'return=representation' };
+  const res = await fetch(
+    `${ENV.SUPABASE_URL}/rest/v1/${table}?${query}`,
+    { method: 'PATCH', headers, body: JSON.stringify(patch) },
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Supabase PATCH ${table}: ${res.status} ${text.substring(0, 300)}`);
   }
-}
-
-async function saveScraperState(queryKey, lastPage, lastBucketIdx) {
-  try {
-    await sbUpsert('scraper_state', [{
-      query_key: queryKey,
-      last_page: lastPage,
-      last_bucket_idx: lastBucketIdx,
-      updated_at: new Date().toISOString(),
-    }], 'query_key');
-  } catch (err) {
-    log('  ', `State save failed for ${queryKey}: ${err.message.substring(0, 80)}`);
-  }
+  return res.json();
 }
 
 // ─────────────────────────── Lookup maps ─────────────────────────────
@@ -240,7 +247,7 @@ const PLATFORM_DEFAULTS = {
 async function githubFetch(url, raw = false) {
   const headers = {
     Accept: raw ? 'application/vnd.github.v3.raw' : 'application/vnd.github.v3+json',
-    'User-Agent': 'OneSkill-Scraper/3.0',
+    'User-Agent': 'OneSkill-Scraper/4.0',
   };
   if (ENV.GITHUB_PAT) headers.Authorization = `token ${ENV.GITHUB_PAT}`;
 
@@ -261,7 +268,7 @@ async function githubFetch(url, raw = false) {
     await sleep(Math.min(wait, 65000));
     return null;
   }
-  if (res.status === 422) return null;  // unprocessable query
+  if (res.status === 422) return null;
   if (!res.ok) return null;
   return raw ? res.text() : res.json();
 }
@@ -276,9 +283,9 @@ async function searchRepos(query, sort = 'stars', pages = 1) {
     const data = await githubFetch(url);
     if (!data || !data.items) break;
     repos.push(...data.items);
-    if (data.items.length < 30) break;   // last page
-    if (page >= 34) break;               // GitHub hard limit: 1000 results (34*30)
-    await sleep(2200);                    // Search API: 30 req/min
+    if (data.items.length < 30) break;
+    if (page >= 34) break;
+    await sleep(2200);
   }
   return repos;
 }
@@ -289,7 +296,146 @@ async function fetchReadme(owner, repo) {
   return typeof text === 'string' ? text : null;
 }
 
-// ─────────────────────────── Gemini API ──────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════════════
+// PHASE 1: DISCOVER — GitHub Search → raw_repos (no Gemini)
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Convert a GitHub API repo object to a raw_repos row.
+ */
+function repoToRawRow(repo, hint, readme) {
+  return {
+    github_full_name:  repo.full_name,
+    owner_login:       repo.owner.login,
+    repo_name:         repo.name,
+    description:       (repo.description || '').substring(0, 500),
+    language:          repo.language || null,
+    stars:             repo.stargazers_count || 0,
+    forks:             repo.forks_count || 0,
+    open_issues:       repo.open_issues_count || 0,
+    license:           repo.license?.spdx_id || repo.license?.name || null,
+    default_branch:    repo.default_branch || 'main',
+    topics:            JSON.stringify(repo.topics || []),
+    github_url:        repo.html_url,
+    owner_avatar_url:  repo.owner.avatar_url,
+    owner_html_url:    repo.owner.html_url,
+    github_created_at: repo.created_at,
+    github_updated_at: repo.updated_at,
+    readme_raw:        readme ? readme.substring(0, 50000) : null,
+    type_hint:         hint,
+    updated_at:        new Date().toISOString(),
+  };
+}
+
+/**
+ * Discover repos via GitHub search and save to raw_repos staging table.
+ * No Gemini involved — purely GitHub → Supabase.
+ */
+async function runDiscover(queries, cap = 0) {
+  log('🔎', `\n═══ PHASE 1: DISCOVER ═══\n`);
+
+  const seen = new Set();
+  const repoBuffer = [];    // { repo, hint } — repos waiting for README fetch
+  let totalSaved = 0;
+
+  for (const queryDef of queries) {
+    if (cap && seen.size >= cap) {
+      log('📦', `Hit ${cap} cap — stopping search`);
+      break;
+    }
+
+    const { hint, q, sort, pages, bucketed } = queryDef;
+    const buckets = bucketed ? STAR_BUCKETS : [''];
+
+    for (const bucket of buckets) {
+      if (cap && seen.size >= cap) break;
+
+      const fullQuery = bucket ? `${q} ${bucket}` : q;
+      const maxPages = Math.min(pages, 34);
+
+      log('🔎', `[${hint}] ${fullQuery} (${maxPages}p)`);
+      const repos = await searchRepos(fullQuery, sort, maxPages);
+
+      let added = 0;
+      for (const repo of repos) {
+        if (cap && seen.size >= cap) break;
+        const key = repo.full_name;
+        if (!seen.has(key)) {
+          seen.add(key);
+          repoBuffer.push({ repo, hint });
+          added++;
+        }
+      }
+      log('  ', `→ ${repos.length} results, ${added} new (${seen.size} total)`);
+      await sleep(2500);
+
+      if (repos.length < 30) continue;
+    }
+
+    // Flush buffer in chunks of 50 (fetch READMEs → save to raw_repos)
+    while (repoBuffer.length >= 50) {
+      const batch = repoBuffer.splice(0, 50);
+      totalSaved += await fetchReadmesAndSave(batch);
+    }
+  }
+
+  // Flush remaining
+  if (repoBuffer.length > 0) {
+    totalSaved += await fetchReadmesAndSave(repoBuffer.splice(0));
+  }
+
+  log('📊', `Discovery complete: ${seen.size} unique repos found, ${totalSaved} saved to raw_repos`);
+  return totalSaved;
+}
+
+/**
+ * Fetch READMEs for a batch and upsert to raw_repos.
+ */
+async function fetchReadmesAndSave(batch) {
+  log('📖', `Fetching READMEs for ${batch.length} repos`);
+  const rows = [];
+
+  for (let i = 0; i < batch.length; i++) {
+    const { repo, hint } = batch[i];
+    if (i > 0 && i % 25 === 0) log('  ', `READMEs: ${i}/${batch.length}`);
+    const readme = await fetchReadme(repo.owner.login, repo.name);
+    rows.push(repoToRawRow(repo, hint, readme));
+    await sleep(350);
+  }
+
+  // Upsert to raw_repos — update metadata on conflict but DON'T overwrite enrichment_status
+  // if it's already enriched
+  let saved = 0;
+  for (let start = 0; start < rows.length; start += BATCH_SIZE) {
+    const chunk = rows.slice(start, start + BATCH_SIZE);
+    try {
+      const result = await sbUpsert('raw_repos', chunk, 'github_full_name');
+      saved += result.length;
+    } catch (err) {
+      log('⚠️', `raw_repos batch save error: ${err.message.substring(0, 120)}`);
+      // Fallback: save one by one
+      for (const row of chunk) {
+        try {
+          await sbUpsert('raw_repos', [row], 'github_full_name');
+          saved++;
+        } catch (e2) {
+          log('  ', `Skip ${row.github_full_name}: ${e2.message.substring(0, 80)}`);
+        }
+      }
+    }
+  }
+
+  log('💾', `Saved ${saved}/${rows.length} repos to raw_repos`);
+  return saved;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// PHASE 2: ENRICH — raw_repos → Gemini → artifacts
+// ═══════════════════════════════════════════════════════════════════════
+
+// ─── Gemini ──────────────────────────────────────────────────────────
 
 const GEMINI_CATEGORIES = Object.keys(CATEGORY_LABEL_TO_SLUG);
 const GEMINI_PLATFORMS  = [
@@ -301,25 +447,16 @@ const GEMINI_PLATFORMS  = [
   'Toolhouse', 'Browserbase', 'Steel', 'Firecrawl', 'Apify', 'Julep', 'Letta',
 ];
 
-// ─── JSON repair helper ─────────────────────────────────────────────
 function repairJSON(raw) {
   let s = raw;
-
-  // 1. Strip markdown code fences
   s = s.replace(/^```(?:json)?\s*/gm, '').replace(/```\s*$/gm, '');
-
-  // 2. Fix trailing commas before ] or }
   s = s.replace(/,\s*([\]}])/g, '$1');
-
-  // 3. Try direct parse first
   try { return JSON.parse(s); } catch (_) { /* continue */ }
 
-  // 4. Extract JSON array
   const m = s.match(/\[[\s\S]*\]/);
   if (m) { try { return JSON.parse(m[0]); } catch (_) { /* continue */ } }
 
-  // 5. Fix unescaped newlines/tabs inside JSON string values
-  //    Walk character by character to only escape control chars inside strings
+  // Fix unescaped control chars inside JSON strings
   let fixed = '';
   let inString = false;
   let escaped = false;
@@ -333,18 +470,15 @@ function repairJSON(raw) {
       if (ch === '\n') { fixed += '\\n'; continue; }
       if (ch === '\r') { fixed += '\\r'; continue; }
       if (ch === '\t') { fixed += '\\t'; continue; }
-      // Strip other control chars
       if (ch.charCodeAt(0) < 32) continue;
     }
     fixed += ch;
   }
-  // Fix trailing commas again after our edits
   fixed = fixed.replace(/,\s*([\]}])/g, '$1');
   try { return JSON.parse(fixed); } catch (_) { /* continue */ }
 
-  // 6. Nuclear option: strip ALL control chars except structural whitespace
+  // Nuclear option
   let nuclear = src.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
-  // Escape newlines inside strings (rough heuristic)
   nuclear = nuclear.replace(/"([^"]*?)"/g, (match) => {
     return match.replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
   });
@@ -354,7 +488,6 @@ function repairJSON(raw) {
   throw new Error('JSON repair failed');
 }
 
-// ─── Validate one Gemini enrichment result ──────────────────────────
 const VALID_TYPES = ['skill', 'mcp-server', 'cursor-rules', 'n8n-node', 'workflow', 'langchain-tool', 'crewai-tool'];
 
 function validateEnrichment(p, hint) {
@@ -367,18 +500,16 @@ function validateEnrichment(p, hint) {
   return p;
 }
 
-// ─── Build the Gemini prompt for N repos ────────────────────────────
 function buildGeminiPrompt(items) {
   const repoSummaries = items.map((item, idx) => {
-    const r = item.repo;
     const excerpt = item.readme ? item.readme.substring(0, 1800) : 'No README.';
     return `### REPO_${idx}
-- full_name: ${r.full_name}
-- description: ${r.description || '(none)'}
-- language: ${r.language || 'Unknown'}
-- stars: ${r.stargazers_count} | forks: ${r.forks_count}
-- topics: ${(r.topics || []).join(', ') || '(none)'}
-- updated: ${r.updated_at}
+- full_name: ${item.full_name}
+- description: ${item.description || '(none)'}
+- language: ${item.language || 'Unknown'}
+- stars: ${item.stars} | forks: ${item.forks}
+- topics: ${item.topics_str || '(none)'}
+- updated: ${item.github_updated_at}
 README excerpt:
 ${excerpt}`;
   }).join('\n\n');
@@ -404,8 +535,10 @@ Each object shape:
 {"artifact_type":"...","long_description":"2-3 sentences.","category":"...","tags":[...],"compatible_platforms":[...],"install_command":"...","npm_package_name":null,"meta_title":"under 60 chars","meta_description":"under 160 chars"}`;
 }
 
-// ─── Call Gemini for a single repo (fallback) ───────────────────────
-async function enrichOneWithGemini(item, retries = 1) {
+/**
+ * Enrich a single raw_repo row via Gemini. Returns enrichment result or null.
+ */
+async function enrichOneWithGemini(item, retries = 2) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await fetch(`${GEMINI_URL}?key=${ENV.GEMINI_API_KEY}`, {
@@ -422,7 +555,7 @@ async function enrichOneWithGemini(item, retries = 1) {
       const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
       const parsed = repairJSON(raw);
       const arr = Array.isArray(parsed) ? parsed : [parsed];
-      return validateEnrichment(arr[0], item.hint);
+      return validateEnrichment(arr[0], item.type_hint);
     } catch (err) {
       if (attempt === retries) return null;
       await sleep(2000);
@@ -432,7 +565,7 @@ async function enrichOneWithGemini(item, retries = 1) {
 }
 
 /**
- * Enrich a batch of repos in a SINGLE Gemini call.
+ * Enrich a batch of raw_repos via a SINGLE Gemini call.
  * Falls back to individual calls if batch parsing fails.
  */
 async function enrichBatchWithGemini(items, retries = 2) {
@@ -464,7 +597,7 @@ async function enrichBatchWithGemini(items, retries = 2) {
       if (!Array.isArray(parsed)) throw new Error(`Expected array, got ${typeof parsed}`);
       while (parsed.length < items.length) parsed.push(null);
 
-      return parsed.map((p, idx) => validateEnrichment(p, items[idx].hint));
+      return parsed.map((p, idx) => validateEnrichment(p, items[idx].type_hint));
 
     } catch (err) {
       if (attempt === retries) {
@@ -472,7 +605,7 @@ async function enrichBatchWithGemini(items, retries = 2) {
         const results = [];
         for (const item of items) {
           results.push(await enrichOneWithGemini(item));
-          await sleep(300);
+          await sleep(500);
         }
         return results;
       }
@@ -483,19 +616,19 @@ async function enrichBatchWithGemini(items, retries = 2) {
   return items.map(() => null);
 }
 
-// ─────────────────────────── Contributors ────────────────────────────
+// ─── Contributors ────────────────────────────────────────────────────
 
 const contributorCache = new Map();
 
-async function ensureContributor(repo) {
-  const username = repo.owner.login;
+async function ensureContributor(rawRepo) {
+  const username = rawRepo.owner_login;
   if (contributorCache.has(username)) return contributorCache.get(username);
 
   const row = {
     github_username: username,
     display_name:    username,
-    avatar_url:      repo.owner.avatar_url,
-    github_url:      repo.owner.html_url,
+    avatar_url:      rawRepo.owner_avatar_url,
+    github_url:      rawRepo.owner_html_url,
   };
 
   try {
@@ -514,61 +647,61 @@ async function ensureContributor(repo) {
   return null;
 }
 
-// ─────────────────────────── Build artifact ──────────────────────────
+// ─── Build artifact from raw_repo + enrichment ──────────────────────
 
-function buildArtifact(repo, enrichment, typeHint, readme, contributorId) {
+function buildArtifact(rawRepo, enrichment, contributorId) {
   const e = enrichment || {};
-  const typeSlug = e.artifact_type || typeHint;
+  const typeSlug = e.artifact_type || rawRepo.type_hint;
   const catLabel = e.category || 'AI / ML';
   const catSlug  = CATEGORY_LABEL_TO_SLUG[catLabel] || 'ai-ml';
 
-  const stars = repo.stargazers_count || 0;
-  const forks = repo.forks_count || 0;
-  const daysAgo = (Date.now() - new Date(repo.updated_at).getTime()) / 86400000;
+  const stars = rawRepo.stars || 0;
+  const forks = rawRepo.forks || 0;
+  const daysAgo = (Date.now() - new Date(rawRepo.github_updated_at).getTime()) / 86400000;
   const starScore    = Math.min(40, Math.floor(Math.log10(Math.max(1, stars)) * 15));
   const forkScore    = Math.min(15, Math.floor(Math.log10(Math.max(1, forks)) * 8));
   const recencyScore = daysAgo < 14 ? 20 : daysAgo < 30 ? 15 : daysAgo < 90 ? 8 : 0;
   const trendingScore = Math.min(100, starScore + forkScore + recencyScore);
 
-  const slug = repo.full_name.replace('/', '-').toLowerCase().replace(/[^a-z0-9-]/g, '');
+  const slug = rawRepo.github_full_name.replace('/', '-').toLowerCase().replace(/[^a-z0-9-]/g, '');
   const artifactTypeId = TYPE_MAP[typeSlug];
   const categoryId     = CATEGORY_MAP[catSlug];
 
   if (!artifactTypeId) {
-    log('⚠️', `Unknown type "${typeSlug}" for ${repo.full_name} — skipping`);
+    log('⚠️', `Unknown type "${typeSlug}" for ${rawRepo.github_full_name} — skipping`);
     return null;
   }
 
   return {
-    slug, name: repo.name,
-    description:            (repo.description || '').substring(0, 500),
-    long_description:       (e.long_description || repo.description || '').substring(0, 2000),
+    slug, name: rawRepo.repo_name,
+    description:            (rawRepo.description || '').substring(0, 500),
+    long_description:       (e.long_description || rawRepo.description || '').substring(0, 2000),
     artifact_type_id:       artifactTypeId,
     category_id:            categoryId || CATEGORY_MAP['ai-ml'],
     contributor_id:         contributorId,
-    github_url:             repo.html_url,
-    github_repo_full_name:  repo.full_name,
-    default_branch:         repo.default_branch || 'main',
-    language:               repo.language || null,
-    license:                repo.license?.spdx_id || repo.license?.name || null,
-    install_command:        e.install_command || `npx skills add ${repo.full_name}`,
+    github_url:             rawRepo.github_url,
+    github_repo_full_name:  rawRepo.github_full_name,
+    default_branch:         rawRepo.default_branch || 'main',
+    language:               rawRepo.language || null,
+    license:                rawRepo.license || null,
+    install_command:        e.install_command || `npx skills add ${rawRepo.github_full_name}`,
     npm_package_name:       e.npm_package_name || null,
     stars, forks,
-    open_issues:            repo.open_issues_count || 0,
+    open_issues:            rawRepo.open_issues || 0,
     weekly_downloads:       0,
     trending_score:         trendingScore,
     version:                null,
     latest_commit_sha:      null,
-    readme_raw:             readme ? readme.substring(0, 50000) : null,
-    readme_excerpt:         readme ? readme.substring(0, 500) : null,
+    readme_raw:             rawRepo.readme_raw ? rawRepo.readme_raw.substring(0, 50000) : null,
+    readme_excerpt:         rawRepo.readme_raw ? rawRepo.readme_raw.substring(0, 500) : null,
     tags:                   Array.isArray(e.tags) ? e.tags.slice(0, 7) : [],
-    meta_title:             e.meta_title || `${repo.name} — OneSkill`,
-    meta_description:       e.meta_description || (repo.description || '').substring(0, 160),
+    meta_title:             e.meta_title || `${rawRepo.repo_name} — OneSkill`,
+    meta_description:       e.meta_description || (rawRepo.description || '').substring(0, 160),
     status:                 'active',
     source:                 'github_scraper',
     is_featured:            false,
-    github_created_at:      repo.created_at,
-    github_updated_at:      repo.updated_at,
+    github_created_at:      rawRepo.github_created_at,
+    github_updated_at:      rawRepo.github_updated_at,
     last_pipeline_sync:     new Date().toISOString(),
     _platform_labels:       Array.isArray(e.compatible_platforms) && e.compatible_platforms.length
                               ? e.compatible_platforms : (PLATFORM_DEFAULTS[typeSlug] || []),
@@ -576,7 +709,7 @@ function buildArtifact(repo, enrichment, typeHint, readme, contributorId) {
   };
 }
 
-// ─────────────────────────── Upsert artifacts ────────────────────────
+// ─── Upsert artifacts ────────────────────────────────────────────────
 
 async function upsertArtifacts(artifacts) {
   let upserted = 0;
@@ -600,12 +733,22 @@ async function upsertArtifacts(artifacts) {
 
         if (junctionRows.length > 0) {
           try { await sbUpsert('artifact_platforms', junctionRows, 'artifact_id,platform_id'); }
-          catch (err) { log('  ', `Junction issue for ${result[i].slug}: ${err.message.substring(0, 80)}`); }
+          catch (err) { log('  ', `Junction issue: ${err.message.substring(0, 80)}`); }
         }
+
+        // Update raw_repos with the artifact_id link
+        try {
+          await sbPatch(
+            'raw_repos',
+            `github_full_name=eq.${encodeURIComponent(batch[i].github_repo_full_name)}`,
+            { artifact_id: artifactId, enrichment_status: 'enriched', enriched_at: new Date().toISOString() }
+          );
+        } catch { /* non-critical */ }
       }
       log('💾', `Batch upserted: ${result.length} (${upserted} total)`);
     } catch (err) {
       log('❌', `Batch failed: ${err.message.substring(0, 150)}`);
+      // Fallback: one by one
       for (let j = 0; j < rows.length; j++) {
         try {
           const result = await sbUpsert('artifacts', [rows[j]], 'github_repo_full_name');
@@ -619,6 +762,13 @@ async function upsertArtifacts(artifacts) {
               try { await sbUpsert('artifact_platforms', junctionRows, 'artifact_id,platform_id'); }
               catch { /* ignore */ }
             }
+            try {
+              await sbPatch(
+                'raw_repos',
+                `github_full_name=eq.${encodeURIComponent(batch[j].github_repo_full_name)}`,
+                { artifact_id: artifactId, enrichment_status: 'enriched', enriched_at: new Date().toISOString() }
+              );
+            } catch { /* non-critical */ }
           }
         } catch (e2) { log('  ', `Skip: ${e2.message.substring(0, 80)}`); }
       }
@@ -627,143 +777,144 @@ async function upsertArtifacts(artifacts) {
   return upserted;
 }
 
-// ─────────────────────────── Enrich + upsert a chunk ────────────────
-// Shared between bulk and incremental modes
+/**
+ * PHASE 2: Fetch unenriched rows from raw_repos, run Gemini, upsert to artifacts.
+ * Each row is marked as enriched/failed individually — fully retryable.
+ */
+async function runEnrich(limit = ENRICH_LIMIT) {
+  log('🤖', `\n═══ PHASE 2: ENRICH (limit: ${limit}) ═══\n`);
 
-async function enrichAndUpsert(repoMap) {
-  const entries = [...repoMap.entries()];
-  if (!entries.length) return 0;
+  // Fetch pending/failed rows, ordered by stars DESC (enrich popular repos first)
+  // Only retry failed rows if they haven't exceeded MAX_ENRICH_ATTEMPTS
+  const pending = await sbGet(
+    'raw_repos',
+    `enrichment_status=in.(pending,failed)` +
+    `&enrich_attempts=lt.${MAX_ENRICH_ATTEMPTS}` +
+    `&order=stars.desc` +
+    `&limit=${limit}` +
+    `&select=id,github_full_name,owner_login,repo_name,description,language,stars,forks,open_issues,license,default_branch,topics,github_url,owner_avatar_url,owner_html_url,github_created_at,github_updated_at,readme_raw,type_hint,enrich_attempts`
+  );
 
-  // Fetch READMEs
-  log('📖', `Fetching READMEs for ${entries.length} repos`);
-  const readmeMap = new Map();
-  for (let i = 0; i < entries.length; i++) {
-    const [key, { repo }] = entries[i];
-    if (i > 0 && i % 50 === 0) log('  ', `READMEs: ${i}/${entries.length}`);
-    readmeMap.set(key, await fetchReadme(repo.owner.login, repo.name));
-    await sleep(350);
+  if (pending.length === 0) {
+    log('✅', 'No unenriched repos to process');
+    return 0;
   }
 
-  // Enrich via Gemini in batches
-  log('🤖', `Enriching via Gemini (${GEMINI_BATCH}/call → ~${Math.ceil(entries.length / GEMINI_BATCH)} calls)`);
-  const artifacts = [];
+  log('📦', `Found ${pending.length} repos to enrich`);
 
-  for (let start = 0; start < entries.length; start += GEMINI_BATCH) {
-    const chunk = entries.slice(start, start + GEMINI_BATCH);
-    const batchItems = chunk.map(([key, { repo, hint }]) => ({
-      repo, hint, readme: readmeMap.get(key),
+  let totalUpserted = 0;
+  let enriched = 0;
+  let failed = 0;
+
+  // Process in Gemini-batch-sized chunks
+  for (let start = 0; start < pending.length; start += GEMINI_BATCH) {
+    const chunk = pending.slice(start, start + GEMINI_BATCH);
+
+    // Prepare items for Gemini prompt
+    const geminiItems = chunk.map(row => ({
+      full_name:        row.github_full_name,
+      description:      row.description,
+      language:         row.language,
+      stars:            row.stars,
+      forks:            row.forks,
+      topics_str:       Array.isArray(row.topics) ? row.topics.join(', ') : (row.topics || ''),
+      github_updated_at: row.github_updated_at,
+      readme:           row.readme_raw,
+      type_hint:        row.type_hint,
     }));
 
-    const enrichments = await enrichBatchWithGemini(batchItems);
+    log('🤖', `Enriching batch ${Math.floor(start / GEMINI_BATCH) + 1}/${Math.ceil(pending.length / GEMINI_BATCH)} (${chunk.length} repos)`);
+
+    const enrichments = await enrichBatchWithGemini(geminiItems);
     await sleep(800);
 
+    const artifacts = [];
     for (let j = 0; j < chunk.length; j++) {
-      const [key, { repo, hint }] = chunk[j];
-      const contributorId = await ensureContributor(repo);
-      const artifact = buildArtifact(repo, enrichments[j], hint, readmeMap.get(key), contributorId);
-      if (artifact) artifacts.push(artifact);
-    }
-  }
+      const rawRepo = chunk[j];
+      const enrichment = enrichments[j];
 
-  log('✅', `Enriched ${artifacts.length} artifacts — upserting to Supabase`);
-  return await upsertArtifacts(artifacts);
-}
-
-// ─────────────────────────── Discovery (with bucketing) ─────────────
-
-async function discoverRepos(queries, existingRepoMap, cap) {
-  const repoMap = existingRepoMap || new Map();
-  let searchesRun = 0;
-
-  for (const queryDef of queries) {
-    if (cap && repoMap.size >= cap) {
-      log('📦', `Hit ${cap} cap — stopping search`);
-      break;
-    }
-
-    const { hint, q, sort, pages, bucketed } = queryDef;
-    const buckets = bucketed ? STAR_BUCKETS : [''];
-
-    for (const bucket of buckets) {
-      if (cap && repoMap.size >= cap) break;
-
-      const fullQuery = bucket ? `${q} ${bucket}` : q;
-      const maxPages = Math.min(pages, 34);
-
-      log('🔎', `[${hint}] ${fullQuery} (${maxPages}p)`);
-      const repos = await searchRepos(fullQuery, sort, maxPages);
-      searchesRun++;
-
-      let added = 0;
-      for (const repo of repos) {
-        if (cap && repoMap.size >= cap) break;
-        const key = repo.full_name;
-        if (!repoMap.has(key)) {
-          repoMap.set(key, { repo, hint });
-          added++;
+      if (!enrichment) {
+        // Mark as failed, increment attempt counter
+        failed++;
+        const newAttempts = (rawRepo.enrich_attempts || 0) + 1;
+        const newStatus = newAttempts >= MAX_ENRICH_ATTEMPTS ? 'skipped' : 'failed';
+        try {
+          await sbPatch(
+            'raw_repos',
+            `id=eq.${rawRepo.id}`,
+            {
+              enrichment_status: newStatus,
+              enrichment_error: 'Gemini enrichment returned null',
+              enrich_attempts: newAttempts,
+              updated_at: new Date().toISOString(),
+            }
+          );
+        } catch { /* non-critical */ }
+        if (newStatus === 'skipped') {
+          log('  ', `⏭️  Skipping ${rawRepo.github_full_name} after ${newAttempts} failed attempts`);
         }
+        continue;
       }
-      log('  ', `→ ${repos.length} results, ${added} new (${repoMap.size} total)`);
-      await sleep(2500);
 
-      // If this bucket returned fewer than a full page, skip remaining buckets
-      if (repos.length < 30) continue;
+      // Increment attempt counter even on success (for tracking)
+      try {
+        await sbPatch(
+          'raw_repos',
+          `id=eq.${rawRepo.id}`,
+          { enrich_attempts: (rawRepo.enrich_attempts || 0) + 1, updated_at: new Date().toISOString() }
+        );
+      } catch { /* non-critical */ }
+
+      const contributorId = await ensureContributor(rawRepo);
+      const artifact = buildArtifact(rawRepo, enrichment, contributorId);
+      if (artifact) {
+        artifact._raw_repo_full_name = rawRepo.github_full_name;
+        artifacts.push(artifact);
+        enriched++;
+      }
+    }
+
+    if (artifacts.length > 0) {
+      totalUpserted += await upsertArtifacts(artifacts);
     }
   }
 
-  log('📊', `Discovery: ${repoMap.size} unique repos from ${searchesRun} queries`);
-  return repoMap;
+  log('🏁', `Enrich complete: ${enriched} enriched, ${failed} failed, ${totalUpserted} upserted to artifacts`);
+  return totalUpserted;
 }
 
-// ─────────────────────────── Main: INCREMENTAL mode ─────────────────
+
+// ═══════════════════════════════════════════════════════════════════════
+// MODE RUNNERS
+// ═══════════════════════════════════════════════════════════════════════
 
 async function runIncremental() {
-  log('🔄', `\n═══ INCREMENTAL MODE — cap ${INCREMENTAL_CAP} repos ═══\n`);
+  log('🔄', `\n═══ INCREMENTAL MODE — discover recent + enrich pending ═══\n`);
 
-  // Use "updated" sort + pushed:>DATE to find recently changed repos
+  // Phase 1: Discover recently updated repos
   const since = new Date(Date.now() - 4 * 3600 * 1000).toISOString().split('T')[0];
   const incrementalQueries = SEARCH_QUERIES.map(sq => ({
     ...sq,
-    // For incremental: fewer pages, sort by recently updated
     pages: Math.min(sq.pages, 5),
     bucketed: false,
     sort: 'updated',
     q: `${sq.q} pushed:>=${since}`,
   }));
 
-  const repoMap = await discoverRepos(incrementalQueries, new Map(), INCREMENTAL_CAP);
-  if (repoMap.size === 0) {
-    log('✅', 'No new/updated repos found since last run');
-    return;
-  }
+  await runDiscover(incrementalQueries, INCREMENTAL_CAP);
 
-  const upserted = await enrichAndUpsert(repoMap);
-  log('🏁', `Incremental done: ${upserted} artifacts upserted`);
+  // Phase 2: Enrich anything pending (including new + previously failed)
+  await runEnrich(ENRICH_LIMIT);
 }
 
-// ─────────────────────────── Main: BULK mode ────────────────────────
-
 async function runBulk() {
-  log('📦', `\n═══ BULK MODE — full index, no cap ═══\n`);
+  log('📦', `\n═══ BULK MODE — full discover + enrich ═══\n`);
 
-  // Process all queries, using star buckets for bucketed ones
-  const repoMap = await discoverRepos(SEARCH_QUERIES, new Map(), 0);
+  // Phase 1: Full discovery (all queries, all buckets)
+  await runDiscover(SEARCH_QUERIES, 0);
 
-  log('📊', `\nTotal unique repos discovered: ${repoMap.size}\n`);
-
-  // Process in chunks to avoid OOM and allow progress logging
-  const CHUNK = 200;
-  const entries = [...repoMap.entries()];
-  let totalUpserted = 0;
-
-  for (let start = 0; start < entries.length; start += CHUNK) {
-    const chunk = entries.slice(start, start + CHUNK);
-    const chunkMap = new Map(chunk);
-    log('🔄', `\nProcessing chunk ${Math.floor(start / CHUNK) + 1}/${Math.ceil(entries.length / CHUNK)} (repos ${start + 1}–${start + chunk.length})\n`);
-    totalUpserted += await enrichAndUpsert(chunkMap);
-  }
-
-  log('🏁', `Bulk done: ${totalUpserted} artifacts upserted from ${repoMap.size} repos`);
+  // Phase 2: Enrich everything pending (large limit)
+  await runEnrich(10000);
 }
 
 // ─────────────────────────── Entry point ────────────────────────────
@@ -773,7 +924,13 @@ async function main() {
   validateEnv();
   await loadLookups();
 
-  if (MODE === 'bulk') {
+  if (FLAGS.discover) {
+    // Discover only — no Gemini needed
+    await runDiscover(SEARCH_QUERIES, 0);
+  } else if (FLAGS.enrich) {
+    // Enrich only — pick up pending/failed rows
+    await runEnrich(ENRICH_LIMIT);
+  } else if (FLAGS.bulk) {
     await runBulk();
   } else {
     await runIncremental();

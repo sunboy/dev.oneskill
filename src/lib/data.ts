@@ -1,5 +1,5 @@
 import { supabase } from "./supabase";
-import type { Artifact, ArtifactType, Category, Platform } from "./types";
+import type { Artifact, ArtifactType, ArtifactMention, Category, Platform } from "./types";
 
 // ─── Supabase select with joined relations ──────────────────────────
 
@@ -180,6 +180,27 @@ export async function getArtifactsByContributor(
 
     if (error || !data) return [];
     return data as Artifact[];
+  } catch {
+    return [];
+  }
+}
+
+// ─── Mention queries ──────────────────────────────────────────────────
+
+export async function getMentionsForArtifact(
+  artifactId: string,
+  limit = 10
+): Promise<ArtifactMention[]> {
+  try {
+    const { data, error } = await supabase
+      .from("artifact_mentions")
+      .select("*")
+      .eq("artifact_id", artifactId)
+      .order("mentioned_at", { ascending: false })
+      .limit(limit);
+
+    if (error || !data) return [];
+    return data as ArtifactMention[];
   } catch {
     return [];
   }

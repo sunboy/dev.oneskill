@@ -13,7 +13,14 @@ on:
         type: choice
         options:
           - incremental
+          - discover
+          - enrich
           - bulk
+      enrich_limit:
+        description: 'Max repos to enrich (enrich/incremental modes)'
+        required: false
+        default: '200'
+        type: string
 
 jobs:
   scrape-artifacts:
@@ -32,9 +39,10 @@ jobs:
         with:
           node-version: '20'
 
+      # Scheduled runs → incremental (discover recent + enrich pending)
       - name: Run artifact scraper (incremental)
         if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'incremental')
-        run: node scripts/scrape-github.mjs
+        run: node scripts/scrape-github.mjs --enrich-limit ${{ github.event.inputs.enrich_limit || '200' }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -42,6 +50,28 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Discover only — no Gemini needed, just GitHub search → raw_repos
+      - name: Run artifact scraper (discover only)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'discover'
+        run: node scripts/scrape-github.mjs --discover
+        timeout-minutes: 110
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Enrich only — process pending raw_repos through Gemini
+      - name: Run artifact scraper (enrich only)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'enrich'
+        run: node scripts/scrape-github.mjs --enrich --enrich-limit ${{ github.event.inputs.enrich_limit || '200' }}
+        timeout-minutes: 60
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      # Bulk — full discover + enrich (long-running)
       - name: Run artifact scraper (bulk)
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'bulk'
         run: node scripts/scrape-github.mjs --bulk
