@@ -551,9 +551,11 @@ async function enrichOneWithGemini(item, retries = 3) {
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: {
             temperature: 0.1,
-            maxOutputTokens: 1024,
+            maxOutputTokens: 4096,
             responseMimeType: 'application/json',
             responseSchema: GEMINI_RESPONSE_SCHEMA,
+            // Disable "thinking" — it eats output tokens and causes MAX_TOKENS truncation
+            thinkingConfig: { thinkingBudget: 0 },
           },
         }),
       });
@@ -721,7 +723,7 @@ async function upsertArtifacts(artifacts) {
   for (let start = 0; start < artifacts.length; start += BATCH_SIZE) {
     const batch = artifacts.slice(start, start + BATCH_SIZE);
     const rows = batch.map(a => {
-      const { _platform_labels, _type_slug, ...row } = a;
+      const { _platform_labels, _type_slug, _raw_repo_full_name, ...row } = a;
       return row;
     });
 
