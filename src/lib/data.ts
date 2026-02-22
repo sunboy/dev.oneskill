@@ -137,6 +137,48 @@ export async function getFeaturedArtifacts(): Promise<Artifact[]> {
   }
 }
 
+/**
+ * Curated artifacts: manually featured (is_featured=true) + auto top picks,
+ * deduplicated and limited to `limit`. Manual picks appear first.
+ */
+export async function getCuratedArtifacts(limit = 6): Promise<Artifact[]> {
+  try {
+    // 1. Manually curated (is_featured = true)
+    const { data: manual } = await supabase
+      .from("artifacts")
+      .select(ARTIFACT_SELECT)
+      .eq("is_featured", true)
+      .eq("status", "active")
+      .order("trending_score", { ascending: false })
+      .limit(limit);
+
+    const manualList = (manual || []) as Artifact[];
+    const manualIds = new Set(manualList.map((a) => a.id));
+
+    // 2. Auto top picks by combined score (fill remaining slots)
+    const remaining = limit - manualList.length;
+    let autoList: Artifact[] = [];
+    if (remaining > 0) {
+      const { data: auto } = await supabase
+        .from("artifacts")
+        .select(ARTIFACT_SELECT)
+        .eq("status", "active")
+        .order("vibe_score", { ascending: false })
+        .order("trending_score", { ascending: false })
+        .limit(remaining + manualList.length); // fetch extra to allow dedup
+
+      autoList = ((auto || []) as Artifact[])
+        .filter((a) => !manualIds.has(a.id))
+        .slice(0, remaining);
+    }
+
+    const combined = [...manualList, ...autoList];
+    return combined.length > 0 ? combined : mockArtifacts.slice(0, limit);
+  } catch {
+    return mockArtifacts.slice(0, limit);
+  }
+}
+
 export async function getRecentArtifacts(): Promise<Artifact[]> {
   try {
     const { data, error } = await supabase
