@@ -107,6 +107,138 @@
   background: oklch(0.58 0.22 25 / 0.15);
 }
 
+/* ── README prose styles ─────────────────────────────────── */
+.readme-prose {
+  font-family: var(--font-body);
+  font-size: 0.9375rem;
+  line-height: 1.75;
+  color: var(--color-foreground);
+}
+
+.readme-prose h1,
+.readme-prose h2,
+.readme-prose h3,
+.readme-prose h4,
+.readme-prose h5,
+.readme-prose h6 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.2;
+  margin-top: 2em;
+  margin-bottom: 0.75em;
+  color: var(--color-foreground);
+}
+
+.readme-prose h1 { font-size: 1.5rem; }
+.readme-prose h2 { font-size: 1.25rem; padding-bottom: 0.3em; border-bottom: 1px solid var(--color-rule); }
+.readme-prose h3 { font-size: 1.1rem; }
+.readme-prose h4 { font-size: 1rem; }
+
+.readme-prose p {
+  margin-top: 0;
+  margin-bottom: 1.25em;
+}
+
+.readme-prose a {
+  color: var(--color-vermillion);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color 150ms ease-out;
+}
+.readme-prose a:hover {
+  border-bottom-color: var(--color-vermillion);
+}
+
+.readme-prose strong { font-weight: 600; }
+.readme-prose em { font-style: italic; }
+
+.readme-prose ul,
+.readme-prose ol {
+  margin-top: 0;
+  margin-bottom: 1.25em;
+  padding-left: 1.75em;
+}
+.readme-prose ul { list-style-type: disc; }
+.readme-prose ol { list-style-type: decimal; }
+.readme-prose li { margin-bottom: 0.375em; }
+.readme-prose li > ul,
+.readme-prose li > ol { margin-top: 0.375em; margin-bottom: 0; }
+
+.readme-prose blockquote {
+  margin: 1.25em 0;
+  padding: 0.5em 1em;
+  border-left: 3px solid var(--color-rule);
+  color: var(--color-ink-muted);
+  font-style: italic;
+}
+.readme-prose blockquote p:last-child { margin-bottom: 0; }
+
+.readme-prose code {
+  font-family: var(--font-mono) !important;
+  font-size: 0.8125rem;
+  background: oklch(0.93 0.005 80);
+  padding: 0.15em 0.35em;
+  border-radius: 3px;
+}
+
+.readme-prose pre {
+  margin: 1.25em 0;
+  padding: 1em 1.25em;
+  background: oklch(0.15 0.01 60);
+  color: oklch(0.92 0.005 80);
+  border-radius: 4px;
+  overflow-x: auto;
+  font-size: 0.8125rem;
+  line-height: 1.6;
+}
+.readme-prose pre code {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+  color: inherit;
+  font-size: inherit;
+}
+
+.readme-prose hr {
+  border: none;
+  border-top: 1px solid var(--color-rule);
+  margin: 2em 0;
+}
+
+.readme-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.25em 0;
+  font-size: 0.875rem;
+}
+.readme-prose thead th {
+  font-family: var(--font-mono) !important;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-ink-muted);
+  text-align: left;
+  padding: 0.5em 0.75em;
+  border-bottom: 2px solid var(--color-rule);
+}
+.readme-prose tbody td {
+  padding: 0.5em 0.75em;
+  border-bottom: 1px solid var(--color-rule);
+}
+
+.readme-prose img {
+  max-width: 100%;
+  height: auto;
+  margin: 0.5em 0;
+}
+
+/* Collapse first h1 top-margin (it's usually the repo name, redundant) */
+.readme-prose > h1:first-child,
+.readme-prose > h2:first-child {
+  margin-top: 0;
+}
+
 /* Signal chip value highlight */
 .signal-val {
   font-weight: 500;

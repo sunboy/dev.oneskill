@@ -6,6 +6,7 @@ import VibePanel from "@/components/VibePanel";
 import SignalChips from "@/components/SignalChips";
 import { getArtifactById, getMentionsForArtifact } from "@/lib/data";
 import { artifactTypeLabels, formatNumber, getTimeAgo } from "@/lib/types";
+import MarkdownRenderer from "@/components/MarkdownRenderer";
 import CopyButton from "./CopyButton";
 
 export default async function SkillDetail({ params }: { params: Promise<{ id: string }> }) {
@@ -99,9 +100,7 @@ export default async function SkillDetail({ params }: { params: Promise<{ id: st
             {artifact.readme_raw && (
               <div className="rule pt-8">
                 <span className="text-[0.625rem] tracking-[0.08em] uppercase text-muted-foreground block mb-4" style={{ fontFamily: "var(--font-mono)" }}>README.md</span>
-                <div className="prose prose-sm max-w-none">
-                  <p className="text-[0.9375rem] leading-relaxed text-foreground whitespace-pre-line">{artifact.readme_raw}</p>
-                </div>
+                <MarkdownRenderer content={artifact.readme_raw} />
               </div>
             )}
           </div>
