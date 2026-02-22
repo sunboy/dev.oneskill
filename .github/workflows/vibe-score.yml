@@ -1,9 +1,8 @@
-name: Compute Vibe Scores
+name: Compute Vibe Scores (Manual)
+
+# Manual-only — the daily automated run is in daily-pipeline.yml.
 
 on:
-  schedule:
-    # Run daily at 3:00 UTC (avoids overlap with scraper at 0,4,8...)
-    - cron: '0 3 * * *'
   workflow_dispatch:
 
 jobs:

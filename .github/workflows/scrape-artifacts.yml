@@ -1,29 +1,28 @@
-name: Scrape GitHub for Agent Artifacts
+name: Scrape Artifacts (Manual)
+
+# Manual-only — for initial bulk loads or one-off runs.
+# The daily automated pipeline is in daily-pipeline.yml.
 
 on:
-  schedule:
-    # Incremental every 4 hours (0:00, 4:00, 8:00, 12:00, 16:00, 20:00 UTC)
-    - cron: '0 0,4,8,12,16,20 * * *'
   workflow_dispatch:
     inputs:
       mode:
         description: 'Scraper mode'
         required: true
-        default: 'incremental'
+        default: 'discover'
         type: choice
         options:
-          - incremental
           - discover
           - enrich
           - bulk
       enrich_limit:
-        description: 'Max repos to enrich (enrich/incremental modes)'
+        description: 'Max repos to enrich (enrich/bulk modes)'
         required: false
         default: '200'
         type: string
 
 jobs:
-  scrape-artifacts:
+  scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -31,28 +30,14 @@ jobs:
       contents: read
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      # Scheduled runs → incremental (discover recent + enrich pending)
-      - name: Run artifact scraper (incremental)
-        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'incremental')
-        run: node scripts/scrape-github.mjs --enrich-limit ${{ github.event.inputs.enrich_limit || '200' }}
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # Discover only — no Gemini needed, just GitHub search → raw_repos
-      - name: Run artifact scraper (discover only)
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'discover'
+      # Discover only — GitHub search → raw_repos (no Gemini)
+      - name: Discover
+        if: inputs.mode == 'discover'
         run: node scripts/scrape-github.mjs --discover
         timeout-minutes: 110
         env:
@@ -61,20 +46,20 @@ jobs:
           GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Enrich only — process pending raw_repos through Gemini
-      - name: Run artifact scraper (enrich only)
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'enrich'
-        run: node scripts/scrape-github.mjs --enrich --enrich-limit ${{ github.event.inputs.enrich_limit || '200' }}
+      # Enrich only — raw_repos → Gemini → artifacts
+      - name: Enrich
+        if: inputs.mode == 'enrich'
+        run: node scripts/scrape-github.mjs --enrich --enrich-limit ${{ inputs.enrich_limit || '200' }}
         timeout-minutes: 60
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
-      # Bulk — full discover + enrich (long-running)
-      - name: Run artifact scraper (bulk)
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'bulk'
-        run: node scripts/scrape-github.mjs --bulk
+      # Bulk — full discover + enrich
+      - name: Bulk
+        if: inputs.mode == 'bulk'
+        run: node scripts/scrape-github.mjs --bulk --enrich-limit ${{ inputs.enrich_limit || '500' }}
         timeout-minutes: 110
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -82,9 +67,3 @@ jobs:
           GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Notify on failure
-        if: failure()
-        run: |
-          echo "::error::Artifact scraping workflow failed"
-          exit 1
