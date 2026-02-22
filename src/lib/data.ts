@@ -179,6 +179,24 @@ export async function getCuratedArtifacts(limit = 6): Promise<Artifact[]> {
   }
 }
 
+export async function getRecentlyAdded(limit = 6): Promise<Artifact[]> {
+  try {
+    const { data, error } = await supabase
+      .from("artifacts")
+      .select(ARTIFACT_SELECT)
+      .eq("status", "active")
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (error || !data || data.length === 0) {
+      return mockArtifacts.slice(0, limit);
+    }
+    return data as Artifact[];
+  } catch {
+    return mockArtifacts.slice(0, limit);
+  }
+}
+
 export async function getRecentArtifacts(): Promise<Artifact[]> {
   try {
     const { data, error } = await supabase

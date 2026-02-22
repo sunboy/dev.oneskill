@@ -1,19 +1,22 @@
 import Link from "next/link";
 import Navigation from "@/components/Navigation";
 import Footer from "@/components/Footer";
-import { getCuratedArtifacts, getArtifacts } from "@/lib/data";
+import ArtifactCard from "@/components/ArtifactCard";
+import { getCuratedArtifacts, getArtifacts, getRecentlyAdded, getCategories } from "@/lib/data";
 import { artifactTypeLabels, formatNumber } from "@/lib/types";
 import type { Artifact } from "@/lib/types";
 
 export default async function Home() {
-  const [curated, allArtifacts] = await Promise.all([
+  const [curated, allArtifacts, recentlyAdded, categories] = await Promise.all([
     getCuratedArtifacts(6),
     getArtifacts(),
+    getRecentlyAdded(6),
+    getCategories(),
   ]);
 
   const trendingList = [...allArtifacts]
     .sort((a, b) => b.trending_score - a.trending_score)
-    .slice(0, 8);
+    .slice(0, 6);
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -70,190 +73,87 @@ export default async function Home() {
         </div>
       </section>
 
-      {/* ── Curated Picks ────────────────────────────── */}
+      {/* ── Category bar ─────────────────────────────── */}
+      {categories.length > 0 && (
+        <div className="rule">
+          <div className="container py-3">
+            <div className="flex items-center gap-3 overflow-x-auto no-scrollbar">
+              <span
+                className="text-[0.5625rem] tracking-[0.08em] uppercase text-muted-foreground shrink-0"
+                style={{ fontFamily: "var(--font-mono)" }}
+              >
+                Categories
+              </span>
+              <div className="flex gap-1.5">
+                {categories.map((cat) => (
+                  <Link key={cat.id} href="/explore">
+                    <span
+                      className="text-[0.6875rem] text-muted-foreground px-2.5 py-1 border border-border hover:border-foreground hover:text-foreground transition-colors duration-150 cursor-pointer whitespace-nowrap"
+                      style={{ fontFamily: "var(--font-mono)" }}
+                    >
+                      {cat.label}
+                    </span>
+                  </Link>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Curated Picks (card grid) ──────────────── */}
       {curated.length > 0 && (
         <section className="rule">
           <div className="container py-12 md:py-16">
-            <div className="flex items-baseline justify-between mb-8">
-              <div>
-                <h2
-                  className="text-[clamp(1.25rem,2.5vw,1.75rem)] font-bold tracking-[-0.03em] leading-[1.1]"
-                  style={{ fontFamily: "var(--font-display)" }}
-                >
-                  Curated picks
-                </h2>
-                <p className="mt-1.5 text-[0.8125rem] text-muted-foreground">
-                  Standout artifacts chosen by the community and our team.
-                </p>
-              </div>
-              <Link href="/explore">
-                <span
-                  className="text-[0.75rem] tracking-[0.02em] editorial-link hidden md:inline"
-                  style={{ fontFamily: "var(--font-mono)" }}
-                >
-                  View all
-                </span>
-              </Link>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-0 curated-grid">
-              {curated.map((artifact: Artifact, i: number) => {
-                const hasVibe = artifact.vibe_score > 0;
-                return (
-                  <Link key={artifact.id} href={`/skill/${artifact.slug}`}>
-                    <div className="group curated-card py-6 px-5 cursor-pointer transition-colors duration-150 hover:bg-[oklch(0.96_0.005_80)] h-full">
-                      <div className="flex items-baseline gap-2 mb-2">
-                        <span
-                          className="text-[0.5625rem] tracking-[0.06em] uppercase text-muted-foreground border border-border px-1.5 py-0.5"
-                          style={{ fontFamily: "var(--font-mono)" }}
-                        >
-                          {artifact.artifact_type?.label || "Skill"}
-                        </span>
-                        <span
-                          className="text-[0.5625rem] text-muted-foreground"
-                          style={{ fontFamily: "var(--font-mono)" }}
-                        >
-                          {formatNumber(artifact.stars)} ★
-                        </span>
-                        {hasVibe && (
-                          <span
-                            className="text-[0.5625rem] text-muted-foreground"
-                            style={{ fontFamily: "var(--font-mono)" }}
-                          >
-                            vibe {artifact.vibe_score}
-                          </span>
-                        )}
-                      </div>
-                      <h3
-                        className="text-[1.0625rem] font-semibold tracking-[-0.02em] mb-1.5 group-hover:text-[var(--color-vermillion)] transition-colors duration-150"
-                        style={{ fontFamily: "var(--font-display)" }}
-                      >
-                        {artifact.name}
-                      </h3>
-                      <p className="text-[0.8125rem] text-muted-foreground leading-relaxed line-clamp-2 mb-3">
-                        {artifact.description}
-                      </p>
-                      <div className="flex items-baseline gap-2 flex-wrap">
-                        <span
-                          className="text-[0.5625rem] text-muted-foreground"
-                          style={{ fontFamily: "var(--font-mono)" }}
-                        >
-                          @{artifact.contributor?.github_username || "—"}
-                        </span>
-                        {artifact.artifact_platforms && artifact.artifact_platforms.length > 0 && (
-                          <>
-                            <span className="text-[0.5625rem] text-muted-foreground">·</span>
-                            <span
-                              className="text-[0.5625rem] text-muted-foreground"
-                              style={{ fontFamily: "var(--font-mono)" }}
-                            >
-                              {artifact.artifact_platforms[0]?.platform?.label}
-                              {artifact.artifact_platforms.length > 1
-                                ? ` +${artifact.artifact_platforms.length - 1}`
-                                : ""}
-                            </span>
-                          </>
-                        )}
-                      </div>
-                    </div>
-                  </Link>
-                );
-              })}
+            <SectionHeader title="Curated picks" subtitle="Standout artifacts chosen by the community and our team." href="/explore" />
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-0 artifact-grid">
+              {curated.map((artifact: Artifact) => (
+                <ArtifactCard key={artifact.id} artifact={artifact} />
+              ))}
             </div>
           </div>
         </section>
       )}
 
-      {/* ── Trending List ────────────────────────────── */}
+      {/* ── Trending (card grid) ───────────────────── */}
       <section className="rule">
-        <div className="container py-3">
-          <div className="flex items-baseline justify-between">
-            <h2
-              className="text-[0.625rem] tracking-[0.08em] uppercase text-muted-foreground"
-              style={{ fontFamily: "var(--font-mono)" }}
-            >
-              Trending
-            </h2>
-            <Link href="/explore">
-              <span
-                className="text-[0.625rem] tracking-[0.02em] editorial-link"
-                style={{ fontFamily: "var(--font-mono)" }}
-              >
-                View all
-              </span>
-            </Link>
-          </div>
-        </div>
-
-        {trendingList.map((artifact: Artifact, i: number) => (
-          <Link key={artifact.id} href={`/skill/${artifact.slug}`}>
-            <div className="rule group cursor-pointer transition-colors duration-150 hover:bg-[oklch(0.96_0.005_80)]">
-              <div className="container py-3.5">
-                <div className="flex items-baseline gap-4">
-                  {/* Rank */}
-                  <span
-                    className="text-[0.6875rem] text-muted-foreground w-6 shrink-0 hidden sm:inline"
-                    style={{ fontFamily: "var(--font-mono)" }}
-                  >
-                    {String(i + 1).padStart(2, "0")}
-                  </span>
-
-                  {/* Name + type */}
-                  <div className="flex items-baseline gap-2 min-w-0 flex-1">
-                    <h3
-                      className="text-[0.9375rem] font-semibold tracking-[-0.02em] group-hover:text-[var(--color-vermillion)] transition-colors duration-150 truncate"
-                      style={{ fontFamily: "var(--font-display)" }}
-                    >
-                      {artifact.name}
-                    </h3>
-                    <span
-                      className="text-[0.5rem] tracking-[0.06em] uppercase text-muted-foreground border border-border px-1 py-0.5 shrink-0"
-                      style={{ fontFamily: "var(--font-mono)" }}
-                    >
-                      {artifact.artifact_type?.label || "Skill"}
-                    </span>
-                  </div>
-
-                  {/* Meta */}
-                  <div className="flex items-baseline gap-4 shrink-0">
-                    {artifact.artifact_platforms && artifact.artifact_platforms.length > 0 && (
-                      <span
-                        className="text-[0.6875rem] text-muted-foreground hidden md:inline"
-                        style={{ fontFamily: "var(--font-mono)" }}
-                      >
-                        {artifact.artifact_platforms[0]?.platform?.label}
-                        {artifact.artifact_platforms.length > 1
-                          ? ` +${artifact.artifact_platforms.length - 1}`
-                          : ""}
-                      </span>
-                    )}
-                    <span
-                      className="text-[0.6875rem] text-foreground font-medium"
-                      style={{ fontFamily: "var(--font-mono)" }}
-                    >
-                      {formatNumber(artifact.stars)} ★
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </Link>
-        ))}
-
-        {/* Browse all */}
-        <div className="rule">
-          <div className="container py-5 text-center">
-            <Link href="/explore">
-              <span
-                className="text-[0.8125rem] tracking-[0.02em] editorial-link"
-                style={{ fontFamily: "var(--font-display)" }}
-              >
-                Browse all {allArtifacts.length > 0 ? allArtifacts.length.toLocaleString() : ""} artifacts →
-              </span>
-            </Link>
+        <div className="container py-12 md:py-16">
+          <SectionHeader title="Trending" subtitle="Most popular artifacts this week by stars and community activity." href="/explore" />
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-0 artifact-grid">
+            {trendingList.map((artifact: Artifact) => (
+              <ArtifactCard key={artifact.id} artifact={artifact} />
+            ))}
           </div>
         </div>
       </section>
+
+      {/* ── Recently Added (card grid) ─────────────── */}
+      {recentlyAdded.length > 0 && (
+        <section className="rule">
+          <div className="container py-12 md:py-16">
+            <SectionHeader title="Recently added" subtitle="New artifacts freshly indexed from GitHub." href="/explore" />
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-0 artifact-grid">
+              {recentlyAdded.map((artifact: Artifact) => (
+                <ArtifactCard key={artifact.id} artifact={artifact} />
+              ))}
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* ── Browse all ─────────────────────────────── */}
+      <div className="rule">
+        <div className="container py-5 text-center">
+          <Link href="/explore">
+            <span
+              className="text-[0.8125rem] tracking-[0.02em] editorial-link"
+              style={{ fontFamily: "var(--font-display)" }}
+            >
+              Browse all {allArtifacts.length > 0 ? allArtifacts.length.toLocaleString() : ""} artifacts →
+            </span>
+          </Link>
+        </div>
+      </div>
 
       {/* ── CTA Strip ────────────────────────────────── */}
       <section className="rule-bottom">
@@ -286,6 +186,33 @@ export default async function Home() {
       </section>
 
       <Footer />
+    </div>
+  );
+}
+
+/* ── Reusable section header ─────────────────────── */
+function SectionHeader({ title, subtitle, href }: { title: string; subtitle: string; href: string }) {
+  return (
+    <div className="flex items-baseline justify-between mb-8">
+      <div>
+        <h2
+          className="text-[clamp(1.25rem,2.5vw,1.75rem)] font-bold tracking-[-0.03em] leading-[1.1]"
+          style={{ fontFamily: "var(--font-display)" }}
+        >
+          {title}
+        </h2>
+        <p className="mt-1.5 text-[0.8125rem] text-muted-foreground">
+          {subtitle}
+        </p>
+      </div>
+      <Link href={href}>
+        <span
+          className="text-[0.75rem] tracking-[0.02em] editorial-link hidden md:inline"
+          style={{ fontFamily: "var(--font-mono)" }}
+        >
+          View all →
+        </span>
+      </Link>
     </div>
   );
 }
