@@ -51,7 +51,7 @@ const TYPE_FILTER = TYPE_ARG !== -1 ? process.argv[TYPE_ARG + 1] : null;
 const DISCOVER_LIMIT_ARG = process.argv.indexOf('--discover-limit');
 const DISCOVER_LIMIT = DISCOVER_LIMIT_ARG !== -1
   ? parseInt(process.argv[DISCOVER_LIMIT_ARG + 1], 10) || 300
-  : 300;
+  : 0;   // 0 = no cap unless explicitly set
 
 // ─────────────────────────── Configuration ───────────────────────────
 
