@@ -43,6 +43,16 @@ const ENRICH_LIMIT = ENRICH_LIMIT_ARG !== -1
   ? parseInt(process.argv[ENRICH_LIMIT_ARG + 1], 10) || 200
   : 200;
 
+// --type <slug>  : filter discover queries to only this artifact type
+const TYPE_ARG = process.argv.indexOf('--type');
+const TYPE_FILTER = TYPE_ARG !== -1 ? process.argv[TYPE_ARG + 1] : null;
+
+// --discover-limit N : cap how many repos to discover per run (default: 300)
+const DISCOVER_LIMIT_ARG = process.argv.indexOf('--discover-limit');
+const DISCOVER_LIMIT = DISCOVER_LIMIT_ARG !== -1
+  ? parseInt(process.argv[DISCOVER_LIMIT_ARG + 1], 10) || 300
+  : 300;
+
 // ─────────────────────────── Configuration ───────────────────────────
 
 const BATCH_SIZE     = 20;    // Supabase upsert batch
@@ -52,7 +62,7 @@ const MAX_ENRICH_ATTEMPTS = 3;  // after this many failures, mark as 'skipped'
 const ENRICH_CONCURRENCY = 5;   // parallel Gemini calls
 
 // Incremental: cap per run to stay within GitHub Actions timeout
-const INCREMENTAL_CAP = 500;
+const INCREMENTAL_CAP = 300;
 
 // GitHub Search API returns max 1000 results per query.
 // We use star-range buckets to get past this limit.
@@ -905,9 +915,15 @@ async function runIncremental() {
 
   // Phase 1: Discover recently updated repos
   const since = new Date(Date.now() - 4 * 3600 * 1000).toISOString().split('T')[0];
-  const incrementalQueries = SEARCH_QUERIES.map(sq => ({
+  let baseQueries = SEARCH_QUERIES;
+  if (TYPE_FILTER) {
+    baseQueries = baseQueries.filter(sq => sq.hint === TYPE_FILTER);
+    log('🏷️', `Incremental filtered to ${baseQueries.length} queries for type: ${TYPE_FILTER}`);
+  }
+
+  const incrementalQueries = baseQueries.map(sq => ({
     ...sq,
-    pages: Math.min(sq.pages, 5),
+    pages: Math.min(sq.pages, 3),   // tighter page cap for daily runs
     bucketed: false,
     sort: 'updated',
     q: `${sq.q} pushed:>=${since}`,
@@ -937,8 +953,17 @@ async function main() {
   await loadLookups();
 
   if (FLAGS.discover) {
-    // Discover only — no Gemini needed
-    await runDiscover(SEARCH_QUERIES, 0);
+    // Discover only — optionally filtered by --type and capped by --discover-limit
+    let queries = SEARCH_QUERIES;
+    if (TYPE_FILTER) {
+      queries = queries.filter(sq => sq.hint === TYPE_FILTER);
+      log('🏷️', `Filtered to ${queries.length} queries for type: ${TYPE_FILTER}`);
+      if (queries.length === 0) {
+        log('⚠️', `No queries found for type "${TYPE_FILTER}". Valid types: ${[...new Set(SEARCH_QUERIES.map(q => q.hint))].join(', ')}`);
+        return;
+      }
+    }
+    await runDiscover(queries, DISCOVER_LIMIT || 0);
   } else if (FLAGS.enrich) {
     // Enrich only — pick up pending/failed rows
     await runEnrich(ENRICH_LIMIT);

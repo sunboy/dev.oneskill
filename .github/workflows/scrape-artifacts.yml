@@ -20,6 +20,20 @@ on:
         required: false
         default: '200'
         type: string
+      artifact_type:
+        description: 'Filter to one artifact type (discover mode)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - mcp-server
+          - skill
+          - cursor-rules
+          - n8n-node
+          - workflow
+          - langchain-tool
+          - crewai-tool
 
 jobs:
   scrape:
@@ -38,7 +52,12 @@ jobs:
       # Discover only — GitHub search → raw_repos (no Gemini)
       - name: Discover
         if: inputs.mode == 'discover'
-        run: node scripts/scrape-github.mjs --discover
+        run: |
+          ARGS="--discover"
+          if [ "${{ inputs.artifact_type }}" != "all" ]; then
+            ARGS="$ARGS --type ${{ inputs.artifact_type }}"
+          fi
+          node scripts/scrape-github.mjs $ARGS
         timeout-minutes: 110
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}

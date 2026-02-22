@@ -1,7 +1,7 @@
 name: Daily Pipeline
 
-# Chained: incremental discover → enrich pending → vibe score
-# Runs once daily. Manual trigger also available.
+# Per-type discover (parallel) → enrich → vibe score
+# Each artifact type gets its own discover job to avoid timeouts.
 
 on:
   schedule:
@@ -9,44 +9,145 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ── Job 1: Incremental discover (capped at 500 new repos) ──────────
-  discover:
+  # ── Parallel discover jobs — one per artifact type ──────────────────
+  discover-mcp:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    timeout-minutes: 20
     permissions:
       contents: read
-
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Incremental discover
-        run: node scripts/scrape-github.mjs --enrich-limit 500
-        timeout-minutes: 25
+        with: { node-version: '20' }
+      - name: Discover MCP servers
+        run: node scripts/scrape-github.mjs --discover --type mcp-server --discover-limit 300
+        timeout-minutes: 18
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # ── Job 2: Enrich pending raw_repos through Gemini ─────────────────
-  enrich:
-    needs: discover
+  discover-skills:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
+    timeout-minutes: 20
     permissions:
       contents: read
-
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+        with: { node-version: '20' }
+      - name: Discover Skills
+        run: node scripts/scrape-github.mjs --discover --type skill --discover-limit 300
+        timeout-minutes: 18
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  discover-cursor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Discover Cursor Rules
+        run: node scripts/scrape-github.mjs --discover --type cursor-rules --discover-limit 200
+        timeout-minutes: 12
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  discover-n8n:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Discover n8n Nodes
+        run: node scripts/scrape-github.mjs --discover --type n8n-node --discover-limit 200
+        timeout-minutes: 12
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  discover-workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Discover Workflows
+        run: node scripts/scrape-github.mjs --discover --type workflow --discover-limit 200
+        timeout-minutes: 12
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  discover-langchain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Discover LangChain Tools
+        run: node scripts/scrape-github.mjs --discover --type langchain-tool --discover-limit 200
+        timeout-minutes: 12
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  discover-crewai:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Discover CrewAI Tools
+        run: node scripts/scrape-github.mjs --discover --type crewai-tool --discover-limit 200
+        timeout-minutes: 12
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Enrich: runs after ALL discover jobs complete ────────────────────
+  enrich:
+    needs: [discover-mcp, discover-skills, discover-cursor, discover-n8n, discover-workflows, discover-langchain, discover-crewai]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
       - name: Enrich pending repos
         run: node scripts/scrape-github.mjs --enrich --enrich-limit 200
         timeout-minutes: 55
@@ -55,21 +156,18 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
-  # ── Job 3: Compute vibe scores ─────────────────────────────────────
+  # ── Vibe scores: runs after enrich ──────────────────────────────────
   vibe-score:
     needs: enrich
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
-
     permissions:
       contents: read
-
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
+        with: { node-version: '20' }
       - name: Compute vibe scores
         run: node scripts/vibe-score.mjs
         timeout-minutes: 85
@@ -81,9 +179,3 @@ jobs:
           REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Notify on failure
-        if: failure()
-        run: |
-          echo "::error::Daily pipeline failed at vibe-score stage"
-          exit 1
