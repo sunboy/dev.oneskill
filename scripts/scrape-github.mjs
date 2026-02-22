@@ -278,9 +278,9 @@ async function githubFetch(url, raw = false, retries = GITHUB_MAX_RETRIES) {
       return null;
     }
 
-    if (res.status === 422) return null;  // bad query, don't retry
+    if (res.status === 404 || res.status === 422) return null;  // not found / bad query — don't retry
     if (!res.ok) {
-      if (attempt < retries) {
+      if (res.status >= 500 && attempt < retries) {
         log('⚠️', `GitHub ${res.status} — retry ${attempt + 1}/${retries}`);
         await sleep(3000 * (attempt + 1));
         continue;
