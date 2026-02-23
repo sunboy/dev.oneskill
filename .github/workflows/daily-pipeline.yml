@@ -2,6 +2,7 @@ name: Daily Pipeline
 
 # Per-type discover (parallel) → enrich → vibe score
 # Each artifact type gets its own discover job to avoid timeouts.
+# All 7 discover jobs run in parallel — billed minutes = sum of all jobs.
 
 on:
   schedule:
@@ -12,7 +13,7 @@ jobs:
   # ── Parallel discover jobs — one per artifact type ──────────────────
   discover-mcp:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 100
     permissions:
       contents: read
     steps:
@@ -21,7 +22,7 @@ jobs:
         with: { node-version: '20' }
       - name: Discover MCP servers
         run: node scripts/scrape-github.mjs --discover --type mcp-server
-        timeout-minutes: 40
+        timeout-minutes: 90
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -30,7 +31,7 @@ jobs:
 
   discover-skills:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 100
     permissions:
       contents: read
     steps:
@@ -39,7 +40,7 @@ jobs:
         with: { node-version: '20' }
       - name: Discover Skills
         run: node scripts/scrape-github.mjs --discover --type skill
-        timeout-minutes: 40
+        timeout-minutes: 90
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -48,7 +49,7 @@ jobs:
 
   discover-cursor:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 70
     permissions:
       contents: read
     steps:
@@ -57,7 +58,7 @@ jobs:
         with: { node-version: '20' }
       - name: Discover Cursor Rules
         run: node scripts/scrape-github.mjs --discover --type cursor-rules
-        timeout-minutes: 25
+        timeout-minutes: 60
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -66,7 +67,7 @@ jobs:
 
   discover-n8n:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 70
     permissions:
       contents: read
     steps:
@@ -75,7 +76,7 @@ jobs:
         with: { node-version: '20' }
       - name: Discover n8n Nodes
         run: node scripts/scrape-github.mjs --discover --type n8n-node
-        timeout-minutes: 25
+        timeout-minutes: 60
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -84,7 +85,7 @@ jobs:
 
   discover-workflows:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 70
     permissions:
       contents: read
     steps:
@@ -93,7 +94,7 @@ jobs:
         with: { node-version: '20' }
       - name: Discover Workflows
         run: node scripts/scrape-github.mjs --discover --type workflow
-        timeout-minutes: 25
+        timeout-minutes: 60
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -102,7 +103,7 @@ jobs:
 
   discover-langchain:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 70
     permissions:
       contents: read
     steps:
@@ -111,7 +112,7 @@ jobs:
         with: { node-version: '20' }
       - name: Discover LangChain Tools
         run: node scripts/scrape-github.mjs --discover --type langchain-tool
-        timeout-minutes: 25
+        timeout-minutes: 60
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -120,7 +121,7 @@ jobs:
 
   discover-crewai:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 70
     permissions:
       contents: read
     steps:
@@ -129,7 +130,7 @@ jobs:
         with: { node-version: '20' }
       - name: Discover CrewAI Tools
         run: node scripts/scrape-github.mjs --discover --type crewai-tool
-        timeout-minutes: 25
+        timeout-minutes: 60
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
