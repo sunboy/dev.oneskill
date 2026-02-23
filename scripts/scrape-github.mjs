@@ -40,8 +40,8 @@ const IS_INCREMENTAL = !FLAGS.discover && !FLAGS.enrich && !FLAGS.bulk;
 
 const ENRICH_LIMIT_ARG = process.argv.indexOf('--enrich-limit');
 const ENRICH_LIMIT = ENRICH_LIMIT_ARG !== -1
-  ? parseInt(process.argv[ENRICH_LIMIT_ARG + 1], 10) || 200
-  : 200;
+  ? parseInt(process.argv[ENRICH_LIMIT_ARG + 1], 10) || 500
+  : 500;
 
 // --type <slug>  : filter discover queries to only this artifact type
 const TYPE_ARG = process.argv.indexOf('--type');
@@ -801,23 +801,38 @@ async function upsertArtifacts(artifacts) {
 async function runEnrich(limit = ENRICH_LIMIT) {
   log('🤖', `\n═══ PHASE 2: ENRICH (limit: ${limit}) ═══\n`);
 
-  // Fetch pending/failed rows, ordered by stars DESC (enrich popular repos first)
-  // Only retry failed rows if they haven't exceeded MAX_ENRICH_ATTEMPTS
-  const pending = await sbGet(
-    'raw_repos',
-    `enrichment_status=in.(pending,failed)` +
-    `&enrich_attempts=lt.${MAX_ENRICH_ATTEMPTS}` +
-    `&order=stars.desc` +
-    `&limit=${limit}` +
-    `&select=id,github_full_name,owner_login,repo_name,description,language,stars,forks,open_issues,license,default_branch,topics,github_url,owner_avatar_url,owner_html_url,github_created_at,github_updated_at,readme_raw,type_hint,enrich_attempts`
-  );
+  // Fetch pending/failed rows PER TYPE so every artifact type gets a fair share.
+  // Without this, the top-N by stars would all be MCP servers (most popular type).
+  const ENRICH_SELECT = `id,github_full_name,owner_login,repo_name,description,language,stars,forks,open_issues,license,default_branch,topics,github_url,owner_avatar_url,owner_html_url,github_created_at,github_updated_at,readme_raw,type_hint,enrich_attempts`;
+  const typeHints = [...new Set(SEARCH_QUERIES.map(q => q.hint))];
+  const perTypeLimit = Math.max(20, Math.ceil(limit / typeHints.length));
+
+  log('📋', `Fetching up to ${perTypeLimit} per type across ${typeHints.length} types`);
+
+  let pending = [];
+  for (const hint of typeHints) {
+    const rows = await sbGet(
+      'raw_repos',
+      `enrichment_status=in.(pending,failed)` +
+      `&type_hint=eq.${encodeURIComponent(hint)}` +
+      `&enrich_attempts=lt.${MAX_ENRICH_ATTEMPTS}` +
+      `&order=stars.desc` +
+      `&limit=${perTypeLimit}` +
+      `&select=${ENRICH_SELECT}`
+    );
+    log('  ', `${hint}: ${rows.length} pending`);
+    pending.push(...rows);
+  }
+
+  // Sort combined list by stars DESC for processing priority
+  pending.sort((a, b) => (b.stars || 0) - (a.stars || 0));
 
   if (pending.length === 0) {
     log('✅', 'No unenriched repos to process');
     return 0;
   }
 
-  log('📦', `Found ${pending.length} repos to enrich`);
+  log('📦', `Found ${pending.length} repos to enrich (${perTypeLimit} per type, ${typeHints.length} types)`);
 
   let totalUpserted = 0;
   let enriched = 0;

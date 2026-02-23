@@ -12,7 +12,7 @@ jobs:
   # ── Parallel discover jobs — one per artifact type ──────────────────
   discover-mcp:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -20,8 +20,8 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Discover MCP servers
-        run: node scripts/scrape-github.mjs --discover --type mcp-server --discover-limit 300
-        timeout-minutes: 18
+        run: node scripts/scrape-github.mjs --discover --type mcp-server --discover-limit 1000
+        timeout-minutes: 40
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -30,7 +30,7 @@ jobs:
 
   discover-skills:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -38,8 +38,8 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Discover Skills
-        run: node scripts/scrape-github.mjs --discover --type skill --discover-limit 300
-        timeout-minutes: 18
+        run: node scripts/scrape-github.mjs --discover --type skill --discover-limit 1000
+        timeout-minutes: 40
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -48,7 +48,7 @@ jobs:
 
   discover-cursor:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -56,8 +56,8 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Discover Cursor Rules
-        run: node scripts/scrape-github.mjs --discover --type cursor-rules --discover-limit 200
-        timeout-minutes: 12
+        run: node scripts/scrape-github.mjs --discover --type cursor-rules --discover-limit 500
+        timeout-minutes: 25
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -66,7 +66,7 @@ jobs:
 
   discover-n8n:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -74,8 +74,8 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Discover n8n Nodes
-        run: node scripts/scrape-github.mjs --discover --type n8n-node --discover-limit 200
-        timeout-minutes: 12
+        run: node scripts/scrape-github.mjs --discover --type n8n-node --discover-limit 500
+        timeout-minutes: 25
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -84,7 +84,7 @@ jobs:
 
   discover-workflows:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -92,8 +92,8 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Discover Workflows
-        run: node scripts/scrape-github.mjs --discover --type workflow --discover-limit 200
-        timeout-minutes: 12
+        run: node scripts/scrape-github.mjs --discover --type workflow --discover-limit 500
+        timeout-minutes: 25
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -102,7 +102,7 @@ jobs:
 
   discover-langchain:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -110,8 +110,8 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Discover LangChain Tools
-        run: node scripts/scrape-github.mjs --discover --type langchain-tool --discover-limit 200
-        timeout-minutes: 12
+        run: node scripts/scrape-github.mjs --discover --type langchain-tool --discover-limit 500
+        timeout-minutes: 25
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -120,7 +120,7 @@ jobs:
 
   discover-crewai:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -128,8 +128,8 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Discover CrewAI Tools
-        run: node scripts/scrape-github.mjs --discover --type crewai-tool --discover-limit 200
-        timeout-minutes: 12
+        run: node scripts/scrape-github.mjs --discover --type crewai-tool --discover-limit 500
+        timeout-minutes: 25
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -141,7 +141,7 @@ jobs:
     needs: [discover-mcp, discover-skills, discover-cursor, discover-n8n, discover-workflows, discover-langchain, discover-crewai]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -149,8 +149,8 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Enrich pending repos
-        run: node scripts/scrape-github.mjs --enrich --enrich-limit 200
-        timeout-minutes: 55
+        run: node scripts/scrape-github.mjs --enrich --enrich-limit 500
+        timeout-minutes: 85
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
