@@ -47,11 +47,30 @@ const ENRICH_LIMIT = ENRICH_LIMIT_ARG !== -1
 const TYPE_ARG = process.argv.indexOf('--type');
 const TYPE_FILTER = TYPE_ARG !== -1 ? process.argv[TYPE_ARG + 1] : null;
 
-// --discover-limit N : cap how many repos to discover per run (default: 300)
+// --discover-limit N : cap how many repos to discover per run (default: no cap)
 const DISCOVER_LIMIT_ARG = process.argv.indexOf('--discover-limit');
 const DISCOVER_LIMIT = DISCOVER_LIMIT_ARG !== -1
   ? parseInt(process.argv[DISCOVER_LIMIT_ARG + 1], 10) || 300
   : 0;   // 0 = no cap unless explicitly set
+
+// --time-budget M : gracefully stop discovery after M minutes, flush & exit clean.
+// This prevents hard timeout kills that lose in-flight work.
+const TIME_BUDGET_ARG = process.argv.indexOf('--time-budget');
+const TIME_BUDGET_MIN = TIME_BUDGET_ARG !== -1
+  ? parseInt(process.argv[TIME_BUDGET_ARG + 1], 10) || 0
+  : 0;   // 0 = no budget (run until done or hard-killed)
+const START_TIME = Date.now();
+
+function timeExpired() {
+  if (!TIME_BUDGET_MIN) return false;
+  const elapsedMin = (Date.now() - START_TIME) / 60000;
+  return elapsedMin >= TIME_BUDGET_MIN;
+}
+
+function timeRemaining() {
+  if (!TIME_BUDGET_MIN) return Infinity;
+  return TIME_BUDGET_MIN - (Date.now() - START_TIME) / 60000;
+}
 
 // ─────────────────────────── Configuration ───────────────────────────
 
@@ -374,11 +393,13 @@ function repoToRawRow(repo, hint, readme) {
  * No Gemini involved — purely GitHub → Supabase.
  */
 async function runDiscover(queries, cap = 0) {
-  log('🔎', `\n═══ PHASE 1: DISCOVER (${queries.length} queries${cap ? `, cap: ${cap}` : ', no cap'}) ═══\n`);
+  const budgetStr = TIME_BUDGET_MIN ? `, budget: ${TIME_BUDGET_MIN}min` : '';
+  log('🔎', `\n═══ PHASE 1: DISCOVER (${queries.length} queries${cap ? `, cap: ${cap}` : ', no cap'}${budgetStr}) ═══\n`);
 
   const seen = new Set();
   const repoBuffer = [];    // { repo, hint } — repos waiting for README fetch
   let totalSaved = 0;
+  let stoppedByBudget = false;
 
   for (let qi = 0; qi < queries.length; qi++) {
     const queryDef = queries[qi];
@@ -386,14 +407,20 @@ async function runDiscover(queries, cap = 0) {
       log('📦', `Hit ${cap} cap — stopping search`);
       break;
     }
+    if (timeExpired()) {
+      log('⏰', `Time budget exhausted (${TIME_BUDGET_MIN}min) — stopping search, will flush remaining buffer`);
+      stoppedByBudget = true;
+      break;
+    }
 
     const { hint, q, sort, pages, bucketed } = queryDef;
     const buckets = bucketed ? STAR_BUCKETS : [''];
 
-    log('📋', `\n── Query ${qi + 1}/${queries.length} [${hint}] (${bucketed ? buckets.length + ' buckets' : 'no buckets'}, ${pages}p) ──`);
+    log('📋', `\n── Query ${qi + 1}/${queries.length} [${hint}] (${bucketed ? buckets.length + ' buckets' : 'no buckets'}, ${pages}p) [${timeRemaining().toFixed(1)}min left] ──`);
 
     for (const bucket of buckets) {
       if (cap && seen.size >= cap) break;
+      if (timeExpired()) { stoppedByBudget = true; break; }
 
       const fullQuery = bucket ? `${q} ${bucket}` : q;
       const maxPages = Math.min(pages, 34);
@@ -416,6 +443,7 @@ async function runDiscover(queries, cap = 0) {
 
       if (repos.length < 30) continue;
     }
+    if (stoppedByBudget) break;
 
     // Flush buffer in chunks of 50 (fetch READMEs → save to raw_repos)
     while (repoBuffer.length >= 50) {

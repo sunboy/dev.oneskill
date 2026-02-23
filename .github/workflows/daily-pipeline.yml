@@ -1,8 +1,8 @@
 name: Daily Pipeline
 
 # Per-type discover (parallel) → enrich → vibe score
-# Each artifact type gets its own discover job to avoid timeouts.
-# All 7 discover jobs run in parallel — billed minutes = sum of all jobs.
+# Each type gets its own discover job. The script uses --time-budget
+# to gracefully stop and flush before the Actions timeout kills it.
 
 on:
   schedule:
@@ -21,8 +21,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Discover MCP servers
-        run: node scripts/scrape-github.mjs --discover --type mcp-server
-        timeout-minutes: 90
+        run: node scripts/scrape-github.mjs --discover --type mcp-server --time-budget 85
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -39,8 +38,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Discover Skills
-        run: node scripts/scrape-github.mjs --discover --type skill
-        timeout-minutes: 90
+        run: node scripts/scrape-github.mjs --discover --type skill --time-budget 85
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -57,8 +55,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Discover Cursor Rules
-        run: node scripts/scrape-github.mjs --discover --type cursor-rules
-        timeout-minutes: 60
+        run: node scripts/scrape-github.mjs --discover --type cursor-rules --time-budget 55
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -75,8 +72,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Discover n8n Nodes
-        run: node scripts/scrape-github.mjs --discover --type n8n-node
-        timeout-minutes: 60
+        run: node scripts/scrape-github.mjs --discover --type n8n-node --time-budget 55
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -93,8 +89,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Discover Workflows
-        run: node scripts/scrape-github.mjs --discover --type workflow
-        timeout-minutes: 60
+        run: node scripts/scrape-github.mjs --discover --type workflow --time-budget 55
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -111,8 +106,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Discover LangChain Tools
-        run: node scripts/scrape-github.mjs --discover --type langchain-tool
-        timeout-minutes: 60
+        run: node scripts/scrape-github.mjs --discover --type langchain-tool --time-budget 55
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -129,8 +123,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Discover CrewAI Tools
-        run: node scripts/scrape-github.mjs --discover --type crewai-tool
-        timeout-minutes: 60
+        run: node scripts/scrape-github.mjs --discover --type crewai-tool --time-budget 55
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
