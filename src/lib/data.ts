@@ -54,16 +54,28 @@ export async function getPlatforms(): Promise<Platform[]> {
 
 export async function getArtifacts(): Promise<Artifact[]> {
   try {
-    const { data, error } = await supabase
-      .from("artifacts")
-      .select(ARTIFACT_SELECT)
-      .eq("status", "active")
-      .order("trending_score", { ascending: false });
+    // Supabase caps at 1000 rows by default — paginate to get all artifacts
+    const PAGE_SIZE = 1000;
+    let allData: Artifact[] = [];
+    let from = 0;
+    let hasMore = true;
 
-    if (error || !data || data.length === 0) {
-      return mockArtifacts;
+    while (hasMore) {
+      const { data, error } = await supabase
+        .from("artifacts")
+        .select(ARTIFACT_SELECT)
+        .eq("status", "active")
+        .order("trending_score", { ascending: false })
+        .range(from, from + PAGE_SIZE - 1);
+
+      if (error || !data) break;
+      allData = allData.concat(data as Artifact[]);
+      hasMore = data.length === PAGE_SIZE;
+      from += PAGE_SIZE;
     }
-    return data as Artifact[];
+
+    if (allData.length === 0) return mockArtifacts;
+    return allData;
   } catch {
     return mockArtifacts;
   }
