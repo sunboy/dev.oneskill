@@ -6,7 +6,7 @@ name: Daily Pipeline
 
 on:
   schedule:
-    - cron: '0 4 * * *'   # 04:00 UTC daily
+    - cron: '0 2,10,18 * * *'   # 3x daily: 02:00, 10:00, 18:00 UTC
   workflow_dispatch:
 
 jobs:
@@ -143,7 +143,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Enrich pending repos
-        run: node scripts/scrape-github.mjs --enrich --enrich-limit 500
+        run: node scripts/scrape-github.mjs --enrich --enrich-limit 1500
         timeout-minutes: 85
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}

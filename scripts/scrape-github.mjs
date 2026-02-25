@@ -40,8 +40,8 @@ const IS_INCREMENTAL = !FLAGS.discover && !FLAGS.enrich && !FLAGS.bulk;
 
 const ENRICH_LIMIT_ARG = process.argv.indexOf('--enrich-limit');
 const ENRICH_LIMIT = ENRICH_LIMIT_ARG !== -1
-  ? parseInt(process.argv[ENRICH_LIMIT_ARG + 1], 10) || 500
-  : 500;
+  ? parseInt(process.argv[ENRICH_LIMIT_ARG + 1], 10) || 1500
+  : 1500;
 
 // --type <slug>  : filter discover queries to only this artifact type
 const TYPE_ARG = process.argv.indexOf('--type');
@@ -445,17 +445,17 @@ async function runDiscover(queries, cap = 0) {
     }
     if (stoppedByBudget) break;
 
-    // Flush buffer in chunks of 50 (fetch READMEs → save to raw_repos)
-    while (repoBuffer.length >= 50) {
-      const batch = repoBuffer.splice(0, 50);
-      totalSaved += await fetchReadmesAndSave(batch);
+    // Flush buffer in chunks of 100 (save to raw_repos WITHOUT README — much faster)
+    while (repoBuffer.length >= 100) {
+      const batch = repoBuffer.splice(0, 100);
+      totalSaved += await saveReposBatch(batch);
       log('💾', `Saved batch — ${totalSaved} total saved, ${seen.size} unique discovered`);
     }
   }
 
   // Flush remaining
   if (repoBuffer.length > 0) {
-    totalSaved += await fetchReadmesAndSave(repoBuffer.splice(0));
+    totalSaved += await saveReposBatch(repoBuffer.splice(0));
   }
 
   log('📊', `Discovery complete: ${seen.size} unique repos found, ${totalSaved} saved to raw_repos`);
@@ -463,22 +463,13 @@ async function runDiscover(queries, cap = 0) {
 }
 
 /**
- * Fetch READMEs for a batch and upsert to raw_repos.
+ * Save repos to raw_repos WITHOUT fetching READMEs.
+ * README is fetched lazily during enrich (when Gemini actually needs it).
+ * This makes discover ~5x faster — pure search API only.
  */
-async function fetchReadmesAndSave(batch) {
-  log('📖', `Fetching READMEs for ${batch.length} repos`);
-  const rows = [];
+async function saveReposBatch(batch) {
+  const rows = batch.map(({ repo, hint }) => repoToRawRow(repo, hint, null));
 
-  for (let i = 0; i < batch.length; i++) {
-    const { repo, hint } = batch[i];
-    if (i > 0 && i % 25 === 0) log('  ', `READMEs: ${i}/${batch.length}`);
-    const readme = await fetchReadme(repo.owner.login, repo.name);
-    rows.push(repoToRawRow(repo, hint, readme));
-    await sleep(350);
-  }
-
-  // Upsert to raw_repos — update metadata on conflict but DON'T overwrite enrichment_status
-  // if it's already enriched
   let saved = 0;
   for (let start = 0; start < rows.length; start += BATCH_SIZE) {
     const chunk = rows.slice(start, start + BATCH_SIZE);
@@ -487,7 +478,6 @@ async function fetchReadmesAndSave(batch) {
       saved += result.length;
     } catch (err) {
       log('⚠️', `raw_repos batch save error: ${err.message.substring(0, 120)}`);
-      // Fallback: save one by one
       for (const row of chunk) {
         try {
           await sbUpsert('raw_repos', [row], 'github_full_name');
@@ -871,6 +861,28 @@ async function runEnrich(limit = ENRICH_LIMIT) {
   const WAVE_SIZE = 20;
   for (let start = 0; start < pending.length; start += WAVE_SIZE) {
     const wave = pending.slice(start, start + WAVE_SIZE);
+
+    // Lazy-fetch READMEs for repos that don't have one yet
+    // (discover phase now skips README for speed — we fetch here instead)
+    let readmeFetched = 0;
+    for (const row of wave) {
+      if (!row.readme_raw) {
+        const readme = await fetchReadme(row.owner_login, row.repo_name);
+        if (readme) {
+          row.readme_raw = readme;
+          // Persist README to raw_repos so we don't re-fetch next time
+          try {
+            await sbPatch('raw_repos', `id=eq.${row.id}`, {
+              readme_raw: readme.substring(0, 50000),
+              updated_at: new Date().toISOString(),
+            });
+          } catch { /* non-critical */ }
+          readmeFetched++;
+        }
+        await sleep(350);
+      }
+    }
+    if (readmeFetched > 0) log('📖', `Fetched ${readmeFetched} missing READMEs for this wave`);
 
     // Prepare items for Gemini prompt
     const geminiItems = wave.map(row => ({
