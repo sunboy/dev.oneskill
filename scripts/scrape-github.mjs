@@ -463,12 +463,25 @@ async function runDiscover(queries, cap = 0) {
 }
 
 /**
- * Save repos to raw_repos WITHOUT fetching READMEs.
- * README is fetched lazily during enrich (when Gemini actually needs it).
- * This makes discover ~5x faster — pure search API only.
+ * Fetch READMEs concurrently (10 at a time) then save batch to raw_repos.
+ * Concurrent fetching is ~5x faster than serial while staying under rate limits.
  */
 async function saveReposBatch(batch) {
-  const rows = batch.map(({ repo, hint }) => repoToRawRow(repo, hint, null));
+  const README_CONCURRENCY = 10;
+  const rows = [];
+
+  // Fetch READMEs in parallel chunks
+  for (let i = 0; i < batch.length; i += README_CONCURRENCY) {
+    const slice = batch.slice(i, i + README_CONCURRENCY);
+    const results = await Promise.all(
+      slice.map(async ({ repo, hint }) => {
+        const readme = await fetchReadme(repo.owner.login, repo.name);
+        return repoToRawRow(repo, hint, readme);
+      })
+    );
+    rows.push(...results);
+    if (i + README_CONCURRENCY < batch.length) await sleep(500);
+  }
 
   let saved = 0;
   for (let start = 0; start < rows.length; start += BATCH_SIZE) {
@@ -861,28 +874,6 @@ async function runEnrich(limit = ENRICH_LIMIT) {
   const WAVE_SIZE = 20;
   for (let start = 0; start < pending.length; start += WAVE_SIZE) {
     const wave = pending.slice(start, start + WAVE_SIZE);
-
-    // Lazy-fetch READMEs for repos that don't have one yet
-    // (discover phase now skips README for speed — we fetch here instead)
-    let readmeFetched = 0;
-    for (const row of wave) {
-      if (!row.readme_raw) {
-        const readme = await fetchReadme(row.owner_login, row.repo_name);
-        if (readme) {
-          row.readme_raw = readme;
-          // Persist README to raw_repos so we don't re-fetch next time
-          try {
-            await sbPatch('raw_repos', `id=eq.${row.id}`, {
-              readme_raw: readme.substring(0, 50000),
-              updated_at: new Date().toISOString(),
-            });
-          } catch { /* non-critical */ }
-          readmeFetched++;
-        }
-        await sleep(350);
-      }
-    }
-    if (readmeFetched > 0) log('📖', `Fetched ${readmeFetched} missing READMEs for this wave`);
 
     // Prepare items for Gemini prompt
     const geminiItems = wave.map(row => ({
