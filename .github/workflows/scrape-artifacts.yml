@@ -14,7 +14,7 @@ on:
         options:
           - discover
           - enrich
-          - bigquery
+          - registries
           - bulk
       enrich_limit:
         description: 'Max repos to enrich (enrich/bulk modes)'
@@ -50,7 +50,7 @@ jobs:
         with:
           node-version: '20'
 
-      # Discover only — GitHub search → raw_repos (no Gemini)
+      # Discover only — GitHub search → raw_repos
       - name: Discover (GitHub)
         if: inputs.mode == 'discover'
         run: |
@@ -66,18 +66,14 @@ jobs:
           GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # BigQuery — bulk scan GitHub file index
-      - name: Discover (BigQuery)
-        if: inputs.mode == 'bigquery'
-        run: |
-          npm install @google-cloud/bigquery
-          node scripts/scrape-bigquery.mjs --time-budget 100
-        timeout-minutes: 110
+      # Registries — Official MCP Registry + PulseMCP + awesome lists
+      - name: Discover (Registries)
+        if: inputs.mode == 'registries'
+        run: node scripts/scrape-registries.mjs
+        timeout-minutes: 30
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
-          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
 
       # Enrich only — raw_repos → Gemini → artifacts
       - name: Enrich
@@ -89,7 +85,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
-      # Bulk — GitHub + BigQuery discover, then enrich
+      # Bulk — all sources + enrich
       - name: Bulk (GitHub discover)
         if: inputs.mode == 'bulk'
         run: node scripts/scrape-github.mjs --discover --time-budget 40
@@ -100,22 +96,18 @@ jobs:
           GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Bulk (BigQuery discover)
+      - name: Bulk (Registry discover)
         if: inputs.mode == 'bulk'
-        run: |
-          npm install @google-cloud/bigquery
-          node scripts/scrape-bigquery.mjs --time-budget 30
-        timeout-minutes: 35
+        run: node scripts/scrape-registries.mjs --time-budget 15
+        timeout-minutes: 20
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
-          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
 
       - name: Bulk (Enrich)
         if: inputs.mode == 'bulk'
         run: node scripts/scrape-github.mjs --enrich --enrich-limit ${{ inputs.enrich_limit || '2000' }}
-        timeout-minutes: 30
+        timeout-minutes: 45
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}

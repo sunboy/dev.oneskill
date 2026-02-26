@@ -1,8 +1,10 @@
 name: Daily Pipeline
 
 # Multi-source discover (parallel) → enrich → vibe score
-# Sources: GitHub Search API (per-type) + BigQuery (bulk file/content discovery)
-# Each source runs in parallel. Enrich runs after all discover jobs complete.
+# Sources:
+#   1. GitHub Search API — per-type parallel jobs (7 types)
+#   2. Registry aggregator — Official MCP Registry + PulseMCP + awesome-lists
+# All sources feed into raw_repos → enrich → artifacts pipeline.
 
 on:
   schedule:
@@ -130,28 +132,25 @@ jobs:
           GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # ── BigQuery bulk discovery — scans GitHub's entire file index ──
-  discover-bigquery:
+  # ── Registry aggregator — pull from existing MCP directories ───
+  discover-registries:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
-      - run: npm install @google-cloud/bigquery
-      - name: Discover via BigQuery
-        run: node scripts/scrape-bigquery.mjs --time-budget 50
+      - name: Aggregate from MCP registries + awesome lists
+        run: node scripts/scrape-registries.mjs --time-budget 15
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
-          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
 
   # ── Enrich: runs after ALL discover jobs complete ────────────────
   enrich:
-    needs: [discover-mcp, discover-skills, discover-cursor, discover-n8n, discover-workflows, discover-langchain, discover-crewai, discover-bigquery]
+    needs: [discover-mcp, discover-skills, discover-cursor, discover-n8n, discover-workflows, discover-langchain, discover-crewai, discover-registries]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
