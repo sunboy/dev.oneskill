@@ -1,8 +1,9 @@
 name: Daily Pipeline
 
-# Per-type discover (parallel) → enrich → vibe score
-# Each type gets its own discover job. The script uses --time-budget
-# to gracefully stop and flush before the Actions timeout kills it.
+# Multi-source discover (parallel) → enrich → vibe score
+# Sources: GitHub Search API + npm + PyPI + Awesome Lists
+# Each source runs in parallel. Enrich runs after all discover jobs complete.
+# Scripts use --time-budget to gracefully stop before Actions timeout.
 
 on:
   schedule:
@@ -10,7 +11,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ── Parallel discover jobs — one per artifact type ──────────────────
+  # ── GitHub Search discover jobs — one per artifact type ─────────
   discover-mcp:
     runs-on: ubuntu-latest
     timeout-minutes: 100
@@ -130,9 +131,55 @@ jobs:
           GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # ── Enrich: runs after ALL discover jobs complete ────────────────────
+  # ── Registry scrapers — npm + PyPI + awesome lists (parallel) ──
+  discover-npm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Discover from npm registry
+        run: node scripts/scrape-registries.mjs --npm --time-budget 25
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+  discover-pypi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Discover from PyPI registry
+        run: node scripts/scrape-registries.mjs --pypi --time-budget 25
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+  discover-awesome:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Discover from awesome lists
+        run: node scripts/scrape-registries.mjs --awesome --time-budget 10
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+  # ── Enrich: runs after ALL discover jobs complete ────────────────
   enrich:
-    needs: [discover-mcp, discover-skills, discover-cursor, discover-n8n, discover-workflows, discover-langchain, discover-crewai]
+    needs: [discover-mcp, discover-skills, discover-cursor, discover-n8n, discover-workflows, discover-langchain, discover-crewai, discover-npm, discover-pypi, discover-awesome]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -143,14 +190,14 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Enrich pending repos
-        run: node scripts/scrape-github.mjs --enrich --enrich-limit 1500
+        run: node scripts/scrape-github.mjs --enrich --enrich-limit 2000
         timeout-minutes: 85
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
-  # ── Vibe scores: runs after enrich ──────────────────────────────────
+  # ── Vibe scores: runs after enrich ──────────────────────────────
   vibe-score:
     needs: enrich
     if: ${{ !cancelled() }}

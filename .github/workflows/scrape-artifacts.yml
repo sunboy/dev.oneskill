@@ -15,10 +15,11 @@ on:
           - discover
           - enrich
           - bulk
+          - registries
       enrich_limit:
         description: 'Max repos to enrich (enrich/bulk modes)'
         required: false
-        default: '500'
+        default: '2000'
         type: string
       artifact_type:
         description: 'Filter to one artifact type (discover mode)'
@@ -50,7 +51,7 @@ jobs:
           node-version: '20'
 
       # Discover only — GitHub search → raw_repos (no Gemini)
-      - name: Discover
+      - name: Discover (GitHub)
         if: inputs.mode == 'discover'
         run: |
           ARGS="--discover"
@@ -65,24 +66,49 @@ jobs:
           GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Registries — npm + PyPI + awesome lists (no GitHub API needed)
+      - name: Discover (Registries)
+        if: inputs.mode == 'registries'
+        run: node scripts/scrape-registries.mjs --all
+        timeout-minutes: 60
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
       # Enrich only — raw_repos → Gemini → artifacts
       - name: Enrich
         if: inputs.mode == 'enrich'
-        run: node scripts/scrape-github.mjs --enrich --enrich-limit ${{ inputs.enrich_limit || '200' }}
-        timeout-minutes: 60
+        run: node scripts/scrape-github.mjs --enrich --enrich-limit ${{ inputs.enrich_limit || '2000' }}
+        timeout-minutes: 85
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
-      # Bulk — full discover + enrich
-      - name: Bulk
+      # Bulk — full discover (GitHub + registries) + enrich
+      - name: Bulk (GitHub discover)
         if: inputs.mode == 'bulk'
-        run: node scripts/scrape-github.mjs --bulk --enrich-limit ${{ inputs.enrich_limit || '500' }}
-        timeout-minutes: 110
+        run: node scripts/scrape-github.mjs --discover --time-budget 50
+        timeout-minutes: 55
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bulk (Registry discover)
+        if: inputs.mode == 'bulk'
+        run: node scripts/scrape-registries.mjs --all --time-budget 20
+        timeout-minutes: 25
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+      - name: Bulk (Enrich)
+        if: inputs.mode == 'bulk'
+        run: node scripts/scrape-github.mjs --enrich --enrich-limit ${{ inputs.enrich_limit || '2000' }}
+        timeout-minutes: 30
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

@@ -350,7 +350,25 @@ async function searchRepos(query, sort = 'stars', pages = 1) {
   return repos;
 }
 
-async function fetchReadme(owner, repo) {
+/**
+ * Fetch README via raw.githubusercontent.com — NO GitHub API auth needed,
+ * NO rate limit impact. Falls back to GitHub API only if raw fetch fails.
+ */
+async function fetchReadme(owner, repo, branch = 'main') {
+  // Try raw.githubusercontent.com first (no auth, no rate limit)
+  for (const filename of ['README.md', 'readme.md', 'Readme.md', 'README.rst', 'README']) {
+    for (const br of [branch, 'main', 'master']) {
+      try {
+        const url = `https://raw.githubusercontent.com/${owner}/${repo}/${br}/${filename}`;
+        const res = await fetch(url, { headers: { 'User-Agent': 'OneSkill-Scraper/4.0' } });
+        if (res.ok) {
+          const text = await res.text();
+          if (text && text.length > 10) return text;
+        }
+      } catch { /* try next */ }
+    }
+  }
+  // Fallback to GitHub API (costs 1 API request)
   const url = `https://api.github.com/repos/${owner}/${repo}/readme`;
   const text = await githubFetch(url, true);
   return typeof text === 'string' ? text : null;
@@ -384,6 +402,7 @@ function repoToRawRow(repo, hint, readme) {
     github_updated_at: repo.updated_at,
     readme_raw:        readme ? readme.substring(0, 50000) : null,
     type_hint:         hint,
+    source:            'github',
     updated_at:        new Date().toISOString(),
   };
 }
@@ -463,25 +482,13 @@ async function runDiscover(queries, cap = 0) {
 }
 
 /**
- * Fetch READMEs concurrently (10 at a time) then save batch to raw_repos.
- * Concurrent fetching is ~5x faster than serial while staying under rate limits.
+ * Save batch of repos to raw_repos WITHOUT fetching README.
+ * README is now fetched lazily during enrich via raw.githubusercontent.com
+ * (no GitHub API auth needed, no rate limit impact).
+ * This makes discover 10x faster — pure metadata only.
  */
 async function saveReposBatch(batch) {
-  const README_CONCURRENCY = 10;
-  const rows = [];
-
-  // Fetch READMEs in parallel chunks
-  for (let i = 0; i < batch.length; i += README_CONCURRENCY) {
-    const slice = batch.slice(i, i + README_CONCURRENCY);
-    const results = await Promise.all(
-      slice.map(async ({ repo, hint }) => {
-        const readme = await fetchReadme(repo.owner.login, repo.name);
-        return repoToRawRow(repo, hint, readme);
-      })
-    );
-    rows.push(...results);
-    if (i + README_CONCURRENCY < batch.length) await sleep(500);
-  }
+  const rows = batch.map(({ repo, hint }) => repoToRawRow(repo, hint, null));
 
   let saved = 0;
   for (let start = 0; start < rows.length; start += BATCH_SIZE) {
@@ -874,6 +881,23 @@ async function runEnrich(limit = ENRICH_LIMIT) {
   const WAVE_SIZE = 20;
   for (let start = 0; start < pending.length; start += WAVE_SIZE) {
     const wave = pending.slice(start, start + WAVE_SIZE);
+
+    // Lazy-fetch README via raw.githubusercontent.com if missing (no API cost)
+    const README_FETCH_CONCURRENCY = 15;
+    for (let ri = 0; ri < wave.length; ri += README_FETCH_CONCURRENCY) {
+      const slice = wave.slice(ri, ri + README_FETCH_CONCURRENCY);
+      await Promise.all(slice.map(async (row) => {
+        if (!row.readme_raw) {
+          row.readme_raw = await fetchReadme(row.owner_login, row.repo_name, row.default_branch);
+          if (row.readme_raw) {
+            // Persist to raw_repos so we don't re-fetch next time
+            try {
+              await sbPatch('raw_repos', `id=eq.${row.id}`, { readme_raw: row.readme_raw.substring(0, 50000) });
+            } catch { /* non-critical */ }
+          }
+        }
+      }));
+    }
 
     // Prepare items for Gemini prompt
     const geminiItems = wave.map(row => ({
